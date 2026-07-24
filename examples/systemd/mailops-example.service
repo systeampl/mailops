@@ -1,0 +1,9 @@
+[Unit]
+Description=Run mailops check for example.com and write node_exporter textfile metrics
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=TEXTFILE_DIR=/var/lib/node_exporter/textfile_collector
+ExecStart=/bin/sh -c 'out="$TEXTFILE_DIR/mailops_example.prom"; /usr/local/bin/mailops check example.com --prom --profile google-workspace --reputation --smtp --mda --no-rbl --timeout 15s --fail-on error > "$out.tmp" && mv "$out.tmp" "$out"'

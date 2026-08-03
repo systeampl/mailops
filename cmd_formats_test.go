@@ -9,7 +9,7 @@ import (
 
 	yamlv3 "gopkg.in/yaml.v3"
 
-	"github.com/systeampl/mailops/internal/mailcheck"
+	mailcheck "github.com/systeampl/mailops/pkg/mailops"
 )
 
 func TestMetricFormattingHelpers(t *testing.T) {
@@ -49,10 +49,12 @@ func TestPrometheusAndYAMLOutputContainOperationalData(t *testing.T) {
 		DKIM:        []mailcheck.DKIMReport{{Selector: "s1", Present: true, Valid: true, KeyType: "rsa", KeyBits: 2048}},
 		SMTP:        []mailcheck.SMTPReport{{Host: "mx.example.com", Port: 25, ConnectOK: true, TLSOK: true}},
 		Findings:    []mailcheck.Finding{{Severity: "warn", Scope: "rbl", Message: "lookup failed"}},
+		RBL:         []mailcheck.RBLReport{{IP: "192.0.2.1", ErrorOn: []string{"rbl.example"}}},
 	}
 	prom := captureStdout(t, func() { printPromReports([]mailcheck.Report{report}) })
 	if !strings.Contains(prom, `mailops_status_code{domain="example.com"} 1`) ||
-		!strings.Contains(prom, `mailops_record_valid{domain="example.com",record="mta_sts"} 0`) {
+		!strings.Contains(prom, `mailops_record_valid{domain="example.com",record="mta_sts"} 0`) ||
+		!strings.Contains(prom, `mailops_rbl_lookup_error{domain="example.com",ip="192.0.2.1",zone="rbl.example"} 1`) {
 		t.Fatalf("Prometheus output missing metrics:\n%s", prom)
 	}
 	yaml := captureStdout(t, func() { printYAMLReports([]mailcheck.Report{report}) })

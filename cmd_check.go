@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -9,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/systeampl/mailops/internal/mailcheck"
+	mailcheck "github.com/systeampl/mailops/pkg/mailops"
+	"gopkg.in/yaml.v3"
 )
 
 func runCheck(args []string) {
@@ -17,6 +19,9 @@ func runCheck(args []string) {
 		"--timeout":       true,
 		"--fail-on":       true,
 		"--otel-endpoint": true,
+		"--resolver":      true,
+		"--domains-file":  true,
+		"--config":        true,
 		"--profile":       true,
 		"--selector":      true,
 		"--rbl":           true,
@@ -32,6 +37,8 @@ func runCheck(args []string) {
 	promOut := fs.Bool("prom", false, "emit Prometheus metrics")
 	strict := fs.Bool("strict", false, "strict policy mode")
 	noRBL := fs.Bool("no-rbl", false, "skip DNSBL checks")
+	noDNSSEC := fs.Bool("no-dnssec", false, "skip DNSSEC authentication checks")
+	noDANE := fs.Bool("no-dane", false, "skip TLSA/DANE discovery and certificate matching")
 	reputation := fs.Bool("reputation", false, "check domain reputation lists such as DBL/SURBL/URIBL")
 	smtp := fs.Bool("smtp", false, "check SMTP port 25, EHLO, STARTTLS, and certificate health for MX hosts")
 	noOpenRelay := fs.Bool("no-open-relay", false, "skip unauthenticated open relay RCPT probe during --smtp checks")
@@ -39,6 +46,10 @@ func runCheck(args []string) {
 	timeoutText := fs.String("timeout", "10s", "overall timeout")
 	failOn := fs.String("fail-on", "critical", "exit non-zero on warn, critical, or error")
 	otelEndpoint := fs.String("otel-endpoint", "", "export OTLP/HTTP metrics endpoint")
+	resolverAddress := fs.String("resolver", "", "DNS resolver IP or host:port")
+	domainsFile := fs.String("domains-file", "", "read additional domains from a line-oriented file")
+	configFile := fs.String("config", "", "read batch/check defaults from a YAML file")
+	allowPrivateTargets := fs.Bool("allow-private-targets", false, "allow active probes to private, loopback, link-local, and special-use addresses")
 	var profiles stringListFlag
 	var selectors stringListFlag
 	var rbls stringListFlag
@@ -58,8 +69,21 @@ func runCheck(args []string) {
 	if err := fs.Parse(args); err != nil {
 		fatal(err.Error())
 	}
-	if fs.NArg() != 1 {
-		fatal("usage: mailops check <domain> [--json|--yaml|--prom]")
+	config, err := loadCheckConfig(*configFile)
+	if err != nil {
+		fatal(err.Error())
+	}
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	applyCheckConfig(config, visited, timeoutText, failOn, resolverAddress, domainsFile, strict, noRBL, noDNSSEC, noDANE, reputation, smtp, noOpenRelay, mda, allowPrivateTargets, &profiles, &selectors, &rbls, &domainBLs, &smtpHosts, &smtpPorts, &mdaHosts, &mdaPorts)
+	domainArgs := append([]string(nil), fs.Args()...)
+	domainArgs = append(domainArgs, config.Domains...)
+	domains, err := collectDomains(domainArgs, *domainsFile)
+	if err != nil {
+		fatal(err.Error())
+	}
+	if len(domains) == 0 {
+		fatal("usage: mailops check <domain...> [--domains-file path] [--json|--yaml|--prom]")
 	}
 	format, err := resolveOutput(*jsonOut, *yamlOut, *promOut)
 	if err != nil {
@@ -104,33 +128,196 @@ func runCheck(args []string) {
 	if len(mdaPortValues) == 0 {
 		mdaPortValues = []int{143, 993, 110, 995}
 	}
-	report := mailcheck.Run(context.Background(), mailcheck.Options{
-		Domain:          fs.Arg(0),
-		Profiles:        appliedProfiles,
-		DKIMSelectors:   selectors,
-		DKIMExplicit:    selectorsExplicit,
-		RBLServers:      rbls,
-		DomainBLServers: domainBLs,
-		Timeout:         timeout,
-		Strict:          *strict,
-		CheckRBL:        !*noRBL,
-		CheckReputation: *reputation,
-		CheckSMTP:       *smtp,
-		SMTPHosts:       smtpHosts,
-		SMTPPorts:       ports,
-		CheckOpenRelay:  *smtp && !*noOpenRelay,
-		CheckMDA:        *mda,
-		MDAHosts:        mdaHosts,
-		MDAExplicit:     mdaHostsExplicit,
-		MDAPorts:        mdaPortValues,
-	})
-	if err := exportReportsOTEL(*otelEndpoint, []mailcheck.Report{report}); err != nil {
+	reports := make([]mailcheck.Report, 0, len(domains))
+	exitCode := 0
+	for _, domain := range domains {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		report := mailcheck.Run(ctx, mailcheck.Options{
+			Domain:              domain,
+			Profiles:            appliedProfiles,
+			DKIMSelectors:       selectors,
+			DKIMExplicit:        selectorsExplicit,
+			RBLServers:          rbls,
+			DomainBLServers:     domainBLs,
+			Timeout:             timeout,
+			Strict:              *strict,
+			CheckRBL:            !*noRBL,
+			CheckReputation:     *reputation,
+			CheckSMTP:           *smtp,
+			SMTPHosts:           smtpHosts,
+			SMTPPorts:           ports,
+			CheckOpenRelay:      *smtp && !*noOpenRelay,
+			CheckMDA:            *mda,
+			MDAHosts:            mdaHosts,
+			MDAExplicit:         mdaHostsExplicit,
+			MDAPorts:            mdaPortValues,
+			ResolverAddress:     *resolverAddress,
+			AllowPrivateTargets: *allowPrivateTargets,
+			DisableDNSSEC:       *noDNSSEC,
+			DisableDANE:         *noDANE,
+		})
+		cancel()
+		reports = append(reports, report)
+		if code := reportExitCode(report, *failOn); code > exitCode {
+			exitCode = code
+		}
+	}
+	exportCtx, exportCancel := context.WithTimeout(context.Background(), timeout)
+	defer exportCancel()
+	if err := exportReportsOTEL(exportCtx, *otelEndpoint, reports); err != nil {
 		fmt.Fprintln(os.Stderr, "mailops: otel export:", err)
 	}
-	printReports([]mailcheck.Report{report}, format)
-	if failOnStatus(report.Status, *failOn) {
-		os.Exit(1)
+	printReports(reports, format)
+	if exitCode != 0 {
+		os.Exit(exitCode)
 	}
+}
+
+type checkFileConfig struct {
+	Domains             []string `yaml:"domains"`
+	DomainsFile         string   `yaml:"domains_file"`
+	Timeout             string   `yaml:"timeout"`
+	FailOn              string   `yaml:"fail_on"`
+	Resolver            string   `yaml:"resolver"`
+	Strict              bool     `yaml:"strict"`
+	NoRBL               bool     `yaml:"no_rbl"`
+	NoDNSSEC            bool     `yaml:"no_dnssec"`
+	NoDANE              bool     `yaml:"no_dane"`
+	Reputation          bool     `yaml:"reputation"`
+	SMTP                bool     `yaml:"smtp"`
+	NoOpenRelay         bool     `yaml:"no_open_relay"`
+	MDA                 bool     `yaml:"mda"`
+	AllowPrivateTargets bool     `yaml:"allow_private_targets"`
+	Profiles            []string `yaml:"profiles"`
+	Selectors           []string `yaml:"selectors"`
+	RBLs                []string `yaml:"rbls"`
+	DomainBLs           []string `yaml:"domain_bls"`
+	SMTPHosts           []string `yaml:"smtp_hosts"`
+	SMTPPorts           []int    `yaml:"smtp_ports"`
+	MDAHosts            []string `yaml:"mda_hosts"`
+	MDAPorts            []int    `yaml:"mda_ports"`
+}
+
+func loadCheckConfig(filename string) (checkFileConfig, error) {
+	var config checkFileConfig
+	if strings.TrimSpace(filename) == "" {
+		return config, nil
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return config, fmt.Errorf("read --config: %w", err)
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return config, fmt.Errorf("parse --config: %w", err)
+	}
+	return config, nil
+}
+
+func applyCheckConfig(config checkFileConfig, visited map[string]bool, timeoutText, failOn, resolverAddress, domainsFile *string, strict, noRBL, noDNSSEC, noDANE, reputation, smtp, noOpenRelay, mda, allowPrivateTargets *bool, profiles, selectors, rbls, domainBLs, smtpHosts, smtpPorts, mdaHosts, mdaPorts *stringListFlag) {
+	if !visited["timeout"] && config.Timeout != "" {
+		*timeoutText = config.Timeout
+	}
+	if !visited["fail-on"] && config.FailOn != "" {
+		*failOn = config.FailOn
+	}
+	if !visited["resolver"] && config.Resolver != "" {
+		*resolverAddress = config.Resolver
+	}
+	if !visited["domains-file"] && config.DomainsFile != "" {
+		*domainsFile = config.DomainsFile
+	}
+	if !visited["strict"] && config.Strict {
+		*strict = true
+	}
+	if !visited["no-rbl"] && config.NoRBL {
+		*noRBL = true
+	}
+	if !visited["no-dnssec"] && config.NoDNSSEC {
+		*noDNSSEC = true
+	}
+	if !visited["no-dane"] && config.NoDANE {
+		*noDANE = true
+	}
+	if !visited["reputation"] && config.Reputation {
+		*reputation = true
+	}
+	if !visited["smtp"] && config.SMTP {
+		*smtp = true
+	}
+	if !visited["no-open-relay"] && config.NoOpenRelay {
+		*noOpenRelay = true
+	}
+	if !visited["mda"] && config.MDA {
+		*mda = true
+	}
+	if !visited["allow-private-targets"] && config.AllowPrivateTargets {
+		*allowPrivateTargets = true
+	}
+	applyStringConfig := func(name string, destination *stringListFlag, values []string) {
+		if !visited[name] && len(values) > 0 {
+			*destination = append((*destination)[:0], values...)
+		}
+	}
+	applyPortConfig := func(name string, destination *stringListFlag, values []int) {
+		if visited[name] || len(values) == 0 {
+			return
+		}
+		*destination = (*destination)[:0]
+		for _, port := range values {
+			*destination = append(*destination, strconv.Itoa(port))
+		}
+	}
+	applyStringConfig("profile", profiles, config.Profiles)
+	applyStringConfig("selector", selectors, config.Selectors)
+	applyStringConfig("rbl", rbls, config.RBLs)
+	applyStringConfig("domainbl", domainBLs, config.DomainBLs)
+	applyStringConfig("smtp-host", smtpHosts, config.SMTPHosts)
+	applyPortConfig("smtp-port", smtpPorts, config.SMTPPorts)
+	applyStringConfig("mda-host", mdaHosts, config.MDAHosts)
+	applyPortConfig("mda-port", mdaPorts, config.MDAPorts)
+}
+
+func collectDomains(args []string, filename string) ([]string, error) {
+	values := append([]string(nil), args...)
+	if strings.TrimSpace(filename) != "" {
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return nil, fmt.Errorf("read --domains-file: %w", err)
+		}
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" && !strings.HasPrefix(line, "#") {
+				values = append(values, line)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, fmt.Errorf("read --domains-file: %w", err)
+		}
+	}
+	seen := map[string]bool{}
+	domains := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		domains = append(domains, value)
+	}
+	return domains, nil
+}
+
+func reportExitCode(report mailcheck.Report, failOn string) int {
+	for _, finding := range report.Findings {
+		if finding.Scope == "input" && finding.Severity == mailcheck.SeverityError {
+			return 2
+		}
+	}
+	if failOnStatus(report.Status, failOn) {
+		return 1
+	}
+	return 0
 }
 
 func printReports(reports []mailcheck.Report, format outputFormat) {
@@ -155,6 +342,8 @@ func printRawReport(report mailcheck.Report) {
 		fmt.Printf("profiles: %s\n", strings.Join(report.Profiles, ", "))
 	}
 	fmt.Printf("status: %s\n", statusColor(report.Status))
+	fmt.Printf("posture: %s\n", statusColor(report.PostureStatus))
+	fmt.Printf("availability: %s\n", statusColor(report.AvailabilityStatus))
 	if report.Error != "" {
 		fmt.Printf("error: %s\n", report.Error)
 	}
@@ -166,9 +355,11 @@ func printRawReport(report mailcheck.Report) {
 		{"spf", "record", statusColor(yesNo(report.SPF.Present)), statusColor(okCritical(report.SPF.Present && report.SPF.Valid))},
 		{"spf", "lookups", fmt.Sprintf("%d", report.SPF.EstimatedLookups), statusColor(spfLookupStatus(report.SPF.EstimatedLookups))},
 		{"spf", "all", emptyDash(report.SPF.AllMechanism), statusColor(spfAllStatus(report.SPF.AllMechanism))},
-		{"dmarc", "policy", statusColor(emptyDash(report.DMARC.Policy)), statusColor(dmarcPolicyStatus(report.DMARC.Policy))},
-		{"dmarc", "pct", fmt.Sprintf("%d", report.DMARC.Pct), statusColor(okWarn(report.DMARC.Pct == 100))},
+		{"dmarc", "policy", statusColor(emptyDash(report.DMARC.EffectivePolicy)), statusColor(dmarcPolicyStatus(report.DMARC.EffectivePolicy))},
+		{"dmarc", "source", emptyDash(report.DMARC.PolicyDomain), "info"},
 		{"dmarc", "rua", fmt.Sprintf("%d", len(report.DMARC.RUA)), statusColor(okWarn(len(report.DMARC.RUA) > 0))},
+		{"dnssec", "authenticated", yesNo(report.DNSSEC.Secure), statusColor(okWarn(report.DNSSEC.Secure))},
+		{"dane", "tlsa", daneCell(report), statusColor(daneStatus(report))},
 		{"dkim", "valid_selectors", fmt.Sprintf("%d/%d", report.RecordCounts.DKIM, len(report.DKIM)), statusColor(dkimStatus(report))},
 		{"mta-sts", "policy", mtaSTSCell(report), statusColor(mtaSTSStatus(report))},
 		{"mta-sts", "mx_covered", mtaSTSMXCell(report), statusColor(mtaSTSMXStatus(report))},
@@ -198,6 +389,28 @@ func printRawReport(report mailcheck.Report) {
 		report.Summary.Critical,
 		report.Summary.Error,
 	)
+}
+
+func daneCell(report mailcheck.Report) string {
+	present := 0
+	for _, row := range report.DANE {
+		if row.Present {
+			present++
+		}
+	}
+	return fmt.Sprintf("%d/%d", present, len(report.DANE))
+}
+
+func daneStatus(report mailcheck.Report) string {
+	for _, row := range report.DANE {
+		if row.Present && !row.Valid {
+			return "critical"
+		}
+		if row.Error != "" {
+			return "warn"
+		}
+	}
+	return "ok"
 }
 
 func renderFindings(findings []mailcheck.Finding) {

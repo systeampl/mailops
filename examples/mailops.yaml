@@ -1,0 +1,15 @@
+domains:
+  - example.com
+  - example.net
+timeout: 15s
+fail_on: critical
+resolver: 1.1.1.1
+profiles: []
+selectors: []
+no_rbl: false
+no_dnssec: false
+no_dane: false
+reputation: false
+smtp: false
+mda: false
+allow_private_targets: false

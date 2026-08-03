@@ -12,6 +12,8 @@ mailops check example.com
 mailops check example.com --json
 mailops check example.com --yaml
 mailops check example.com --prom
+mailops check example.com example.net --json
+mailops check --config examples/mailops.yaml --yaml
 ```
 
 Use a provider profile when the domain is backed by a known mail platform:
@@ -44,7 +46,8 @@ mailops check example.com --otel-endpoint http://localhost:4318
 
 ## Installation
 
-`mailops` requires Go 1.22 or newer. Build it from the project directory:
+`mailops` requires Go 1.25 or newer and selects the patched Go 1.26.5
+toolchain declared in `go.mod`. Build it from the project directory:
 
 ```bash
 go mod download
@@ -58,14 +61,15 @@ Install the resulting binary somewhere on `PATH`, for example:
 sudo install -m 0755 mailops /usr/local/bin/mailops
 ```
 
-Checks use the system DNS resolver. Core checks require outbound DNS and may
+Checks use the system DNS resolver by default; `--resolver` selects another
+recursive resolver. Core checks require outbound DNS and may
 fetch an MTA-STS policy over HTTPS. SMTP, MDA, reputation, and OTEL options
 also require access to their respective network endpoints.
 
 ## Command Reference
 
 ```text
-mailops check <domain> [--json|--yaml|--prom] [options]
+mailops check <domain...> [--json|--yaml|--prom] [options]
 mailops version
 ```
 
@@ -78,6 +82,8 @@ also accept comma-separated values.
 | `--selector <name>` | common selectors | Select DKIM selectors; repeatable. |
 | `--rbl <zone>` | built-in IPv4 DNSBLs | Select IP reputation zones; repeatable. |
 | `--no-rbl` | false | Disable the otherwise enabled MX-IP DNSBL checks. |
+| `--no-dnssec` | false | Disable DNSSEC authentication checks. |
+| `--no-dane` | false | Disable TLSA/DANE discovery and certificate matching. |
 | `--reputation` | false | Enable domain DBL/SURBL/URIBL-style checks. |
 | `--domainbl <zone>` | built-in domain lists | Select domain reputation zones; repeatable. |
 | `--smtp` | false | Probe SMTP endpoints. |
@@ -87,6 +93,10 @@ also accept comma-separated values.
 | `--mda` | false | Probe IMAP and POP3 endpoints. |
 | `--mda-host <host>` | common names | Select MDA hosts; repeatable. |
 | `--mda-port <port>` | `143,993,110,995` | Select MDA ports; repeatable. |
+| `--resolver <address>` | system | Use a DNS resolver IP or `host:port`. |
+| `--domains-file <path>` | none | Add domains from a line-oriented file. |
+| `--config <path>` | none | Load domains and check defaults from YAML. |
+| `--allow-private-targets` | false | Permit active probes to private/special-use addresses. |
 | `--strict` | false | Promote selected policy and transport warnings to critical. |
 | `--timeout <duration>` | `10s` | Set the overall check deadline. |
 | `--fail-on <level>` | `critical` | Exit with status 1 at `warn`, `critical`, or `error`. |
@@ -104,18 +114,22 @@ independent of the selected local output format. If its URL does not end in
 Core DNS and policy checks:
 
 - MX presence and MX host resolution.
-- SPF presence, multiple SPF detection, `all` policy warnings, and estimated
-  DNS lookup count after `include` / `redirect` expansion.
+- SPF syntax, multiple SPF detection, mechanism/address validation, `all`
+  policy warnings, recursive `include` / `redirect`, loops, and lookup limits.
 - DKIM selector discovery and public key parsing.
-- DMARC presence, policy, `pct`, report destinations, and external report
-  authorization hints.
+- DMARC RFC 9989 DNS Tree Walk (up to eight queries), inherited `sp`/`np`
+  policy, PSD boundaries, `t=y`, report destinations, and external report
+  authorization hints. Historic `pct` is reported but ignored.
+- DNSSEC signature/authentication state using the selected recursive resolver.
+- SMTP TLSA/DANE records, DNSSEC protection, syntax, and observed certificate
+  matching when an SMTP TLS probe is available.
 - MTA-STS TXT and HTTPS policy.
 - MTA-STS MX coverage: whether real MX hosts are covered by policy `mx:`
   patterns.
 - TLS-RPT record.
-- BIMI record syntax, HTTPS SVG/SVGZ logo and authority-evidence URIs,
-  explicit publication decline, duplicate records, and DMARC-enforcement
-  compatibility including `pct=100`.
+- BIMI record/tag syntax, safe HTTPS asset retrieval, SVG 1.2 Tiny-PS checks,
+  authority X.509 parsing, explicit publication decline, and effective DMARC
+  enforcement compatibility.
 - PTR and forward-confirmed reverse DNS for MX IPs.
 - DNSBL/RBL checks for MX IPv4 addresses.
 - Optional domain reputation checks through DNS-based DBL/SURBL/URIBL-style
@@ -264,9 +278,37 @@ Prometheus metric names use the `mailops_` prefix. OTEL metric names use the
 
 JSON output is an array of reports, even for one domain. YAML output uses a
 top-level `reports` key. Each report contains the normalized domain, aggregate
-status, individual protocol results, findings, summary counts, generation
+status, separate `posture_status` and `availability_status`, individual
+protocol results, findings with stable `code` values, summary counts, generation
 time, and duration. Prometheus and OTEL output expose the operational subset
 as metrics rather than serializing the entire report.
+
+`schema_version` identifies the machine-readable contract. Consumers can use
+the supported Go API at `github.com/systeampl/mailops/pkg/mailops`; breaking
+schema changes increment the major component.
+
+## Batch and YAML configuration
+
+All positional domains are checked, with one independent timeout per domain:
+
+```bash
+mailops check example.com example.net --json
+mailops check --domains-file domains.txt --prom
+mailops check --config examples/mailops.yaml --yaml
+```
+
+Blank lines and lines beginning with `#` are ignored in domain files. Explicit
+CLI flags override their YAML counterparts. IDNs may be supplied as Unicode or
+as DNS A-labels; reports use normalized A-labels.
+
+## Active-target safety
+
+SMTP, IMAP/POP3, MTA-STS, and BIMI requests reject loopback, private,
+link-local, documentation, carrier-grade NAT, and other special-use addresses
+by default. BIMI HTTP connections are resolved through the selected resolver
+and pinned to an approved address. Use `--allow-private-targets` only for an
+intentional internal monitoring job. The open-relay probe still stops before
+`DATA`.
 
 OTEL export currently uses OTLP/HTTP JSON without custom authentication
 headers. An export failure is written to standard error but does not replace
@@ -304,6 +346,10 @@ Useful DNS/policy metrics:
 - `mailops_spf_estimated_lookups`
 - `mailops_spf_lookup_limit_used`
 - `mailops_dmarc_pct`
+- `mailops_dnssec_secure`
+- `mailops_dane_tlsa_present`
+- `mailops_dane_tlsa_valid`
+- `mailops_dane_tlsa_matched`
 - `mailops_dkim_valid_selectors`
 - `mailops_mta_sts_mx_matched_ratio`
 - `mailops_ptr_forward_confirmed_ratio`
@@ -401,6 +447,7 @@ stubs, so it does not require external DNS, SMTP, IMAP, POP3, or OTLP services.
 go test ./...
 go test -race ./...
 go vet ./...
+go test -tags=integration -v ./integration
 ```
 
 Generate a coverage report with:
@@ -412,20 +459,16 @@ go tool cover -func=coverage.out
 
 ## Current Limitations and Roadmap
 
-- DMARC is currently queried only at `_dmarc.<input-domain>`. The RFC 9989 DNS
-  Tree Walk, Public Suffix Domain policies, and the newer `np`, `psd`, and `t`
-  policy semantics are not implemented yet. Until they are, checking a
-  subdomain can report DMARC as missing even when a parent policy applies.
 - SPF validation estimates DNS-triggering mechanisms and expands
   `include`/`redirect`, but it is not a complete SPF evaluator. It does not
   model macros, void-lookup limits, or every per-mechanism DNS limit.
 - DKIM has no standardized selector discovery mechanism. Common selectors and
   provider profiles are best-effort; use `--selector` for authoritative
   results.
-- BIMI validates the DNS record and its HTTPS URI shapes, but does not fetch or
-  parse the SVG Tiny P/S logo and does not validate VMC/CMC certificate
-  contents.
-- DNSSEC validation and SMTP DANE/TLSA policy checks are not implemented.
+- BIMI parses the authority certificate and its validity period, but does not
+  yet validate the complete VMC/CMC trust chain or the logo-hash extension.
+- DNSSEC status trusts the selected validating recursive resolver's AD bit; it
+  does not perform a local root-to-leaf cryptographic validation.
 - SMTP TLS probing proves that a TLS 1.2+ session with a trusted certificate
   works. It does not enumerate accepted legacy protocol versions, cipher
   suites, or REQUIRETLS support.
@@ -434,10 +477,7 @@ go tool cover -func=coverage.out
 - SMTP open-relay probing stops before `DATA`; it detects RCPT acceptance, not
   final delivery.
 - MDA probes do not log in, verify credentials, or read mailboxes.
-- One domain is checked per invocation, using the system resolver. There is no
-  batch/config-file mode or custom resolver option yet.
-- Unicode IDNs must be supplied in DNS A-label (`xn--...`) form.
 - Public reputation DNS zones may rate-limit or block generic resolver usage.
 - Provider profiles are operational defaults, not authoritative vendor APIs.
-- Automated tests use local resolvers, protocol pipes, TLS servers, and HTTP
-  stubs. An opt-in live integration suite is not included yet.
+- The live integration suite verifies public DNS/policy discovery; it does not
+  send mail or require mailbox credentials.

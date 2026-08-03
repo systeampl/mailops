@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/systeampl/mailops/internal/mailcheck"
+	mailcheck "github.com/systeampl/mailops/pkg/mailops"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -44,7 +45,7 @@ func TestPostOTLPUsesMetricsPathAndServiceResource(t *testing.T) {
 		body = string(data)
 		return &http.Response{StatusCode: http.StatusAccepted, Status: "202 Accepted", Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
 	})
-	if err := postOTLP("https://collector.example", "mailops-test", []otelMetric{otelMetricInt("count", "", "", nil, 1, time.Now())}); err != nil {
+	if err := postOTLP(context.Background(), "https://collector.example", "mailops-test", []otelMetric{otelMetricInt("count", "", "", nil, 1, time.Now())}); err != nil {
 		t.Fatal(err)
 	}
 	if path != "/v1/metrics" || !strings.Contains(body, `"service.name"`) || !strings.Contains(body, `"mailops-test"`) {
@@ -58,7 +59,7 @@ func TestPostOTLPReturnsHTTPError(t *testing.T) {
 	http.DefaultTransport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusBadRequest, Status: "400 Bad Request", Header: http.Header{}, Body: io.NopCloser(strings.NewReader("no")), Request: request}, nil
 	})
-	if err := postOTLP("https://collector.example/v1/metrics", "mailops", nil); err == nil {
+	if err := postOTLP(context.Background(), "https://collector.example/v1/metrics", "mailops", nil); err == nil {
 		t.Fatal("expected OTLP HTTP error")
 	}
 }
@@ -78,22 +79,22 @@ func TestExportReportsOTELBuildsCompletePayload(t *testing.T) {
 		GeneratedAt: time.Unix(100, 0),
 		DKIM:        []mailcheck.DKIMReport{{Selector: "s1", Valid: true}},
 		PTR:         []mailcheck.PTRReport{{IP: "192.0.2.1", ForwardConfirmed: true}},
-		RBL:         []mailcheck.RBLReport{{IP: "192.0.2.1", ListedOn: []string{"rbl.test"}}},
+		RBL:         []mailcheck.RBLReport{{IP: "192.0.2.1", ListedOn: []string{"rbl.test"}, ErrorOn: []string{"broken-rbl.test"}}},
 		DomainBL: []mailcheck.DomainBLReport{{
 			CleanOn: []string{"clean.test"}, ListedOn: []string{"listed.test"}, ErrorOn: []string{"error.test"},
 		}},
 		SMTP: []mailcheck.SMTPReport{{Host: "mx", Port: 25, ConnectOK: true, RelayCheck: true, RelayMailCode: 250, RelayRcptCode: 550}},
 		MDA:  []mailcheck.MDAReport{{Host: "imap", Port: 993, Protocol: "imaps", ConnectOK: true, TLSOK: true}},
 	}
-	if err := exportReportsOTEL("https://collector.example", []mailcheck.Report{report}); err != nil {
+	if err := exportReportsOTEL(context.Background(), "https://collector.example", []mailcheck.Report{report}); err != nil {
 		t.Fatal(err)
 	}
-	for _, metric := range []string{"mailops.check.up", "mailops.dkim.selector_ok", "mailops.rbl.listed", "mailops.domainbl.lookup_error", "mailops.smtp.relay_rcpt_code", "mailops.mda.tls_ok"} {
+	for _, metric := range []string{"mailops.check.up", "mailops.dkim.selector_ok", "mailops.rbl.listed", "mailops.rbl.lookup_error", "mailops.domainbl.lookup_error", "mailops.smtp.relay_rcpt_code", "mailops.mda.tls_ok"} {
 		if !strings.Contains(body, `"`+metric+`"`) {
 			t.Fatalf("payload missing %s", metric)
 		}
 	}
-	if err := exportReportsOTEL("", []mailcheck.Report{report}); err != nil {
+	if err := exportReportsOTEL(context.Background(), "", []mailcheck.Report{report}); err != nil {
 		t.Fatalf("empty endpoint should be disabled: %v", err)
 	}
 }

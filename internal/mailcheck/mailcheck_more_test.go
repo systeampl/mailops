@@ -10,12 +10,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -258,15 +260,110 @@ func TestSPFFindingsDistinguishFailureFromMissingRecord(t *testing.T) {
 	}
 }
 
-func TestCheckDMARCRejectsInvalidPct(t *testing.T) {
+func TestSPFReferencedLookupFailureInvalidatesRecord(t *testing.T) {
+	r := fakeResolver{
+		txt:    map[string][]string{"example.com": {"v=spf1 include:missing.example -all"}},
+		errors: map[string]error{},
+	}
+	report := checkSPF(context.Background(), r, "example.com")
+	if report.Valid || len(report.Errors) == 0 || !strings.Contains(strings.Join(report.Errors, " "), "missing.example") {
+		t.Fatalf("broken SPF include accepted: %#v", report)
+	}
+}
+
+func TestSPFRejectsMalformedMechanismsAndDuplicateRedirect(t *testing.T) {
+	tests := []string{
+		"v=spf1 ip4:999.1.1.1 -all",
+		"v=spf1 ip6:192.0.2.1 -all",
+		"v=spf1 unknown:value -all",
+		"v=spf1 include: -all",
+		"v=spf1 redirect=a.example redirect=b.example",
+	}
+	for _, record := range tests {
+		parsed := parseSPFRecord(record)
+		if len(parsed.Errors) == 0 {
+			t.Fatalf("malformed SPF accepted: %q", record)
+		}
+	}
+
+	r := fakeResolver{txt: map[string][]string{
+		"example.com":   {"v=spf1 include:child.example -all"},
+		"child.example": {"v=spf1 -all", "v=spf1 ~all"},
+	}, errors: map[string]error{}}
+	report := checkSPF(context.Background(), r, "example.com")
+	if report.Valid || !strings.Contains(strings.Join(report.Errors, " "), "multiple SPF") {
+		t.Fatalf("multiple referenced SPF records accepted: %#v", report)
+	}
+}
+
+func TestCheckDMARCIgnoresHistoricPct(t *testing.T) {
 	for _, pct := range []string{"abc", "-1", "101"} {
 		r := fakeResolver{txt: map[string][]string{
 			"_dmarc.example.com": {"v=DMARC1; p=reject; pct=" + pct + "; rua=mailto:dmarc@example.com"},
 		}, errors: map[string]error{}}
 		report := checkDMARC(context.Background(), r, "example.com")
-		if report.Valid || len(report.Errors) == 0 {
-			t.Fatalf("pct=%q accepted: %#v", pct, report)
+		if !report.Valid || len(report.Warnings) == 0 || report.EffectivePolicy != "reject" {
+			t.Fatalf("historic pct=%q affected policy: %#v", pct, report)
 		}
+	}
+}
+
+func TestCheckDMARCRFC9989TreeWalkAndInheritedPolicies(t *testing.T) {
+	r := fakeResolver{
+		txt: map[string][]string{
+			"_dmarc.example.com": {"v=DMARC1; p=reject; sp=quarantine; np=reject; rua=mailto:dmarc@example.com"},
+		},
+		ips:    map[string][]net.IPAddr{"mail.example.com": {{IP: net.ParseIP("192.0.2.10")}}},
+		errors: map[string]error{},
+	}
+	existing := checkDMARC(context.Background(), r, "mail.example.com")
+	if !existing.Valid || !existing.Inherited || existing.PolicyDomain != "example.com" || existing.EffectivePolicy != "quarantine" || existing.AppliedPolicyTag != "sp" {
+		t.Fatalf("inherited existing-domain policy = %#v", existing)
+	}
+
+	nonexistent := checkDMARC(context.Background(), r, "missing.example.com")
+	if nonexistent.EffectivePolicy != "reject" || nonexistent.AppliedPolicyTag != "np" || nonexistent.AuthorDomainExists == nil || *nonexistent.AuthorDomainExists {
+		t.Fatalf("inherited nonexistent-domain policy = %#v", nonexistent)
+	}
+}
+
+func TestCheckDMARCRFC9989PSDAndTestingMode(t *testing.T) {
+	r := fakeResolver{txt: map[string][]string{
+		"_dmarc.example.test": {"v=DMARC1; p=reject; psd=y; t=y; rua=mailto:dmarc@example.test"},
+	}, errors: map[string]error{}}
+	report := checkDMARC(context.Background(), r, "tenant.example.test")
+	if !report.Inherited || report.PSD != "y" || !report.Testing || report.EffectivePolicy != "quarantine" {
+		t.Fatalf("PSD/testing policy = %#v", report)
+	}
+}
+
+func TestCheckDMARCRFC9989DiscardsMultipleRecordsAndUsesParent(t *testing.T) {
+	r := fakeResolver{txt: map[string][]string{
+		"_dmarc.mail.example.com": {"v=DMARC1; p=none", "v=DMARC1; p=reject"},
+		"_dmarc.example.com":      {"v=DMARC1; p=reject; rua=mailto:dmarc@example.com"},
+	}, errors: map[string]error{}}
+	report := checkDMARC(context.Background(), r, "mail.example.com")
+	if !report.Valid || report.PolicyDomain != "example.com" || !strings.Contains(strings.Join(report.Errors, " "), "multiple") {
+		t.Fatalf("multiple-record fallback = %#v", report)
+	}
+}
+
+func TestDMARCTreeWalkIsBoundedToEightQueries(t *testing.T) {
+	targets := dmarcTreeTargets("one.two.three.four.five.six.seven.eight.nine.ten.example")
+	if len(targets) != 8 {
+		t.Fatalf("tree walk has %d targets: %#v", len(targets), targets)
+	}
+	if targets[0] != "one.two.three.four.five.six.seven.eight.nine.ten.example" || targets[1] != "five.six.seven.eight.nine.ten.example" || targets[7] != "example" {
+		t.Fatalf("unexpected targets: %#v", targets)
+	}
+}
+
+func TestDMARCVersionIsCaseSensitive(t *testing.T) {
+	r := fakeResolver{txt: map[string][]string{
+		"_dmarc.example.com": {"v=dmarc1; p=reject"},
+	}, errors: map[string]error{}}
+	if report := checkDMARC(context.Background(), r, "example.com"); report.Present {
+		t.Fatalf("lowercase version accepted: %#v", report)
 	}
 }
 
@@ -447,12 +544,32 @@ func TestReputationLookupsSeparateMissingBlockedAndFailed(t *testing.T) {
 		},
 	}
 	rbl := checkRBL(context.Background(), r, []string{"1.2.3.4"}, []string{"listed.test", "clean.test", "blocked.test", "failed.test"})[0]
-	if len(rbl.ListedOn) != 1 || len(rbl.CleanOn) != 1 || len(rbl.Errors) != 2 {
+	if len(rbl.ListedOn) != 1 || len(rbl.CleanOn) != 1 || len(rbl.ErrorOn) != 2 || len(rbl.Errors) != 2 {
 		t.Fatalf("RBL classification = %#v", rbl)
 	}
 	domainBL := checkDomainBL(context.Background(), r, "example.com", []string{"listed.test", "clean.test", "blocked.test", "failed.test"})[0]
 	if len(domainBL.ListedOn) != 1 || len(domainBL.CleanOn) != 1 || len(domainBL.ErrorOn) != 2 || len(domainBL.Errors) != 2 {
 		t.Fatalf("domain BL classification = %#v", domainBL)
+	}
+}
+
+func TestDNSBLProviderErrorCodesAreNotListingsOrClean(t *testing.T) {
+	r := fakeResolver{
+		ips: map[string][]net.IPAddr{
+			"4.3.2.1.error.test":      {{IP: net.ParseIP("127.255.255.254")}},
+			"4.3.2.1.unexpected.test": {{IP: net.ParseIP("192.0.2.1")}},
+			"example.com.error.test":  {{IP: net.ParseIP("127.255.255.252")}},
+			"example.com.listed.test": {{IP: net.ParseIP("127.0.1.2")}},
+		},
+		errors: map[string]error{},
+	}
+	rbl := checkRBL(context.Background(), r, []string{"1.2.3.4"}, []string{"error.test", "unexpected.test"})[0]
+	if len(rbl.CleanOn) != 0 || len(rbl.ListedOn) != 0 || len(rbl.ErrorOn) != 2 {
+		t.Fatalf("RBL error responses misclassified: %#v", rbl)
+	}
+	domainBL := checkDomainBL(context.Background(), r, "example.com", []string{"error.test", "listed.test"})[0]
+	if len(domainBL.ErrorOn) != 1 || len(domainBL.ListedOn) != 1 || len(domainBL.CleanOn) != 0 {
+		t.Fatalf("domain BL responses misclassified: %#v", domainBL)
 	}
 }
 
@@ -1001,6 +1118,31 @@ func TestBIMIValidationAndFindings(t *testing.T) {
 	}
 }
 
+func TestBIMIResolverFailureProducesFinding(t *testing.T) {
+	r := fakeResolver{errors: map[string]error{"txt:default._bimi.example.com": errors.New("resolver timeout")}}
+	report := checkBIMI(context.Background(), r, "example.com", DMARCReport{})
+	findings := bimiFindings(report)
+	if report.Error == "" || len(findings) != 1 || findings[0].Severity != SeverityWarn {
+		t.Fatalf("BIMI resolver failure was hidden: report=%#v findings=%#v", report, findings)
+	}
+}
+
+func TestSMTPReadStopsAtContextDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	dial := func(context.Context, string, string) (net.Conn, error) { return client, nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	report := checkSMTPHostWithDial(ctx, "mx.example.com", 25, time.Second, false, dial)
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("SMTP read ignored context deadline: %s", elapsed)
+	}
+	if report.Error == "" {
+		t.Fatalf("deadline did not fail stalled SMTP probe: %#v", report)
+	}
+}
+
 func TestBIMIRejectsUnsafeURIsWeakDMARCAndMultipleRecords(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1031,8 +1173,8 @@ func TestBIMIRejectsUnsafeURIsWeakDMARCAndMultipleRecords(t *testing.T) {
 	weakDMARCResolver := fakeResolver{txt: map[string][]string{
 		"default._bimi.example.com": {"v=BIMI1; l=https://example.com/logo.svg; a=https://example.com/vmc.pem"},
 	}, errors: map[string]error{}}
-	weakDMARC := checkBIMI(context.Background(), weakDMARCResolver, "example.com", DMARCReport{Policy: "quarantine", Pct: 50})
-	if !weakDMARC.Valid || !strings.Contains(weakDMARC.Warning, "pct=100") {
+	weakDMARC := checkBIMI(context.Background(), weakDMARCResolver, "example.com", DMARCReport{Policy: "reject", EffectivePolicy: "none", Testing: true, Pct: 100})
+	if !weakDMARC.Valid || !strings.Contains(weakDMARC.Warning, "effective DMARC") {
 		t.Fatalf("weak DMARC compatibility missed: %#v", weakDMARC)
 	}
 	multipleResolver := fakeResolver{txt: map[string][]string{
@@ -1044,6 +1186,50 @@ func TestBIMIRejectsUnsafeURIsWeakDMARCAndMultipleRecords(t *testing.T) {
 	multiple := checkBIMI(context.Background(), multipleResolver, "example.com", DMARCReport{Policy: "reject", Pct: 100})
 	if multiple.Valid || !strings.Contains(multiple.Error, "multiple") {
 		t.Fatalf("multiple BIMI records accepted: %#v", multiple)
+	}
+}
+
+func TestBIMIAssetInspectionValidatesTinyPSAndAuthorityCertificate(t *testing.T) {
+	serverTLS, _ := testTLSConfigs(t, "example.com")
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverTLS.Certificates[0].Certificate[0]})
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := []byte(`<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny-ps"><title>Example</title></svg>`)
+		contentType := "image/svg+xml"
+		if strings.HasSuffix(request.URL.Path, ".pem") {
+			body = certificatePEM
+			contentType = "application/x-pem-file"
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{contentType}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    request,
+		}, nil
+	})}
+	r := fakeResolver{ips: map[string][]net.IPAddr{"example.com": {{IP: net.ParseIP("1.1.1.1")}}}, errors: map[string]error{}}
+	report := BIMIReport{
+		Present:      true,
+		Valid:        true,
+		LogoURL:      "https://example.com/logo.svg",
+		AuthorityURL: "https://example.com/vmc.pem",
+	}
+	inspectBIMIAssetsWithClient(context.Background(), r, &report, false, client)
+	if report.AssetError != "" || !report.LogoFetched || !report.LogoValid || !report.AuthorityFetched || !report.AuthorityValid {
+		t.Fatalf("valid BIMI assets rejected: %#v", report)
+	}
+
+	if err := validateBIMISVG([]byte(`<svg version="1.2" baseProfile="tiny-ps"><script/></svg>`), "image/svg+xml"); err == nil {
+		t.Fatal("active SVG content accepted")
+	}
+}
+
+func TestBIMIRejectsDuplicateTags(t *testing.T) {
+	r := fakeResolver{txt: map[string][]string{
+		"default._bimi.example.com": {"v=BIMI1; l=https://example.com/one.svg; l=https://example.com/two.svg"},
+	}, errors: map[string]error{}}
+	report := checkBIMI(context.Background(), r, "example.com", DMARCReport{EffectivePolicy: "reject"})
+	if report.Valid || !strings.Contains(report.Error, "duplicate") {
+		t.Fatalf("duplicate BIMI tags accepted: %#v", report)
 	}
 }
 
@@ -1063,6 +1249,9 @@ func TestDomainAndMDAEndpointNormalization(t *testing.T) {
 	if got := normalizeDomain(" HTTPS://Mail.Example.COM:8443/path?q=1 "); got != "mail.example.com" {
 		t.Fatalf("domain = %q", got)
 	}
+	if got := normalizeDomain("Żółw.example"); got != "xn--w-uga1v8h.example" {
+		t.Fatalf("IDN domain = %q", got)
+	}
 	if got := domainFromMailto("mailto:reports@Reports.Example.NET!10m"); got != "reports.example.net" {
 		t.Fatalf("mailto domain = %q", got)
 	}
@@ -1074,6 +1263,55 @@ func TestDomainAndMDAEndpointNormalization(t *testing.T) {
 	}
 	if !mdaImplicitTLS(993) || !mdaImplicitTLS(995) || mdaImplicitTLS(143) {
 		t.Fatal("unexpected implicit TLS port classification")
+	}
+}
+
+func TestCustomResolverValidationAndLabel(t *testing.T) {
+	_, endpoint, err := newCustomResolver("1.1.1.1")
+	if err != nil || endpoint != "1.1.1.1:53" {
+		t.Fatalf("resolver endpoint = %q, %v", endpoint, err)
+	}
+	_, endpoint, err = newCustomResolver("[2606:4700:4700::1111]:5353")
+	if err != nil || endpoint != "[2606:4700:4700::1111]:5353" {
+		t.Fatalf("IPv6 resolver endpoint = %q, %v", endpoint, err)
+	}
+	report := Run(context.Background(), Options{Domain: "example.com", ResolverAddress: "bad:address:syntax", Timeout: time.Second})
+	if report.Status != SeverityError || report.Resolver != "bad:address:syntax" || !strings.Contains(report.Error, "invalid resolver") {
+		t.Fatalf("invalid resolver report = %#v", report)
+	}
+}
+
+func TestActiveTargetPolicyBlocksPrivateAndSpecialAddresses(t *testing.T) {
+	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "100.64.0.1", "192.0.2.1", "2001:db8::1"} {
+		address, err := netip.ParseAddr(raw)
+		if err != nil || !unsafeTargetAddress(address) {
+			t.Fatalf("unsafe address %q accepted", raw)
+		}
+	}
+	if unsafeTargetAddress(netip.MustParseAddr("1.1.1.1")) {
+		t.Fatal("public address rejected")
+	}
+
+	r := fakeResolver{
+		txt: map[string][]string{"_mta-sts.example.com": {"v=STSv1; id=one"}},
+		ips: map[string][]net.IPAddr{
+			"smtp.example.com":    {{IP: net.ParseIP("10.0.0.5")}},
+			"imap.example.com":    {{IP: net.ParseIP("127.0.0.1")}},
+			"mta-sts.example.com": {{IP: net.ParseIP("192.0.2.5")}},
+		},
+		errors: map[string]error{},
+	}
+	smtp := checkSMTPWithTargetPolicy(context.Background(), r, nil, []string{"smtp.example.com"}, []int{25}, time.Second, false, false)
+	if len(smtp) != 1 || !strings.Contains(smtp[0].Error, "target blocked") {
+		t.Fatalf("private SMTP target was probed: %#v", smtp)
+	}
+	mda := checkMDAWithTargetPolicy(context.Background(), r, "example.com", []string{"imap.example.com"}, []int{143}, time.Second, true, false)
+	if len(mda) != 1 || !strings.Contains(mda[0].Error, "target blocked") {
+		t.Fatalf("private MDA target was probed: %#v", mda)
+	}
+	mtaSTS := checkMTASTSWithTargetPolicy(context.Background(), r, "example.com", time.Second, false)
+	if !mtaSTS.TXTPresent || !strings.Contains(mtaSTS.Error, "target blocked") {
+		t.Fatalf("private MTA-STS target was fetched: %#v", mtaSTS)
 	}
 }
 

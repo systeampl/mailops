@@ -2,13 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/systeampl/mailops/internal/mailcheck"
+	mailcheck "github.com/systeampl/mailops/pkg/mailops"
 )
 
 type otelPayload struct {
@@ -60,7 +62,7 @@ type otelValue struct {
 	StringValue string `json:"stringValue,omitempty"`
 }
 
-func exportReportsOTEL(endpoint string, reports []mailcheck.Report) error {
+func exportReportsOTEL(ctx context.Context, endpoint string, reports []mailcheck.Report) error {
 	if strings.TrimSpace(endpoint) == "" {
 		return nil
 	}
@@ -73,6 +75,8 @@ func exportReportsOTEL(endpoint string, reports []mailcheck.Report) error {
 			otelMetricFloat("mailops.check.duration", "Mailops check duration", "s", base, float64(report.DurationMS)/1000, now),
 			otelMetricInt("mailops.last_check.timestamp", "Unix timestamp of the last completed check", "s", base, int(report.GeneratedAt.Unix()), now),
 			otelMetricInt("mailops.status_code", "Aggregate status as a numeric code", "", base, statusCode(report.Status), now),
+			otelMetricInt("mailops.posture.status_code", "Configuration posture status as a numeric code", "", base, statusCode(report.PostureStatus), now),
+			otelMetricInt("mailops.availability.status_code", "Active service availability status as a numeric code", "", base, statusCode(report.AvailabilityStatus), now),
 		)
 		for _, status := range []string{"ok", "warn", "critical", "error"} {
 			metrics = append(metrics, otelMetricInt("mailops.status", "Mail deliverability aggregate status", "", map[string]string{
@@ -85,6 +89,7 @@ func exportReportsOTEL(endpoint string, reports []mailcheck.Report) error {
 			otelMetricInt("mailops.spf.estimated_lookups", "Estimated SPF lookup count", "", base, report.SPF.EstimatedLookups, now),
 			otelMetricFloat("mailops.spf.lookup_limit_used", "SPF DNS lookup limit utilization", "1", base, float64(report.SPF.EstimatedLookups)/10, now),
 			otelMetricInt("mailops.dmarc.pct", "DMARC pct tag value", "", base, report.DMARC.Pct, now),
+			otelMetricInt("mailops.dnssec.secure", "DNS response authentication through DNSSEC", "", base, boolInt(report.DNSSEC.Secure), now),
 			otelMetricInt("mailops.dkim.valid_selectors", "Number of valid DKIM selectors found", "", base, report.RecordCounts.DKIM, now),
 			otelMetricFloat("mailops.mta_sts.mx_matched_ratio", "Ratio of MX hosts covered by the MTA-STS policy mx patterns", "1", base, ratio(report.MTASTS.MXMatched, report.MTASTS.MXTotal), now),
 			otelMetricInt("mailops.record.present", "SPF record presence", "", map[string]string{"domain": report.Domain, "record": "spf"}, boolInt(report.SPF.Present), now),
@@ -98,6 +103,14 @@ func exportReportsOTEL(endpoint string, reports []mailcheck.Report) error {
 			otelMetricInt("mailops.record.valid", "TLS-RPT record validity", "", map[string]string{"domain": report.Domain, "record": "tls_rpt"}, boolInt(report.TLSRPT.Valid), now),
 			otelMetricInt("mailops.record.valid", "BIMI record validity", "", map[string]string{"domain": report.Domain, "record": "bimi"}, boolInt(report.BIMI.Valid), now),
 		)
+		for _, row := range report.DANE {
+			labels := map[string]string{"domain": report.Domain, "host": row.Host, "port": strconv.Itoa(row.Port)}
+			metrics = append(metrics,
+				otelMetricInt("mailops.dane.tlsa_present", "TLSA record presence", "", labels, boolInt(row.Present), now),
+				otelMetricInt("mailops.dane.tlsa_valid", "TLSA record syntax and DNSSEC validity", "", labels, boolInt(row.Valid), now),
+				otelMetricInt("mailops.dane.tlsa_matched", "Observed SMTP certificate TLSA match", "", labels, boolInt(row.Matched), now),
+			)
+		}
 		for _, sev := range []string{"info", "warn", "critical", "error"} {
 			metrics = append(metrics, otelMetricInt("mailops.findings", "Number of findings by severity", "", map[string]string{
 				"domain":   report.Domain,
@@ -122,6 +135,15 @@ func exportReportsOTEL(endpoint string, reports []mailcheck.Report) error {
 				"domain": report.Domain,
 				"ip":     row.IP,
 			}, boolInt(len(row.ListedOn) > 0), now))
+			for _, zone := range row.CleanOn {
+				metrics = append(metrics, otelMetricInt("mailops.rbl.lookup_error", "DNSBL lookup or provider response error per IP and zone", "", map[string]string{"domain": report.Domain, "ip": row.IP, "zone": zone}, 0, now))
+			}
+			for _, zone := range row.ListedOn {
+				metrics = append(metrics, otelMetricInt("mailops.rbl.lookup_error", "DNSBL lookup or provider response error per IP and zone", "", map[string]string{"domain": report.Domain, "ip": row.IP, "zone": zone}, 0, now))
+			}
+			for _, zone := range row.ErrorOn {
+				metrics = append(metrics, otelMetricInt("mailops.rbl.lookup_error", "DNSBL lookup or provider response error per IP and zone", "", map[string]string{"domain": report.Domain, "ip": row.IP, "zone": zone}, 1, now))
+			}
 		}
 		for _, row := range report.DomainBL {
 			for _, zone := range row.CleanOn {
@@ -191,7 +213,7 @@ func exportReportsOTEL(endpoint string, reports []mailcheck.Report) error {
 			}
 		}
 	}
-	return postOTLP(endpoint, "mailops", metrics)
+	return postOTLP(ctx, endpoint, "mailops", metrics)
 }
 
 func otelMetricInt(name, description, unit string, labels map[string]string, value int, ts time.Time) otelMetric {
@@ -233,7 +255,7 @@ func otelAttributes(labels map[string]string) []otelAttribute {
 	return out
 }
 
-func postOTLP(endpoint, service string, metrics []otelMetric) error {
+func postOTLP(ctx context.Context, endpoint, service string, metrics []otelMetric) error {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	if !strings.HasSuffix(endpoint, "/v1/metrics") {
 		endpoint += "/v1/metrics"
@@ -251,7 +273,7 @@ func postOTLP(endpoint, service string, metrics []otelMetric) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}

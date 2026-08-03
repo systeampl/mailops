@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/systeampl/mailops/internal/mailcheck"
+	mailcheck "github.com/systeampl/mailops/pkg/mailops"
 )
 
 func TestPolicyAndRecordDisplayStatuses(t *testing.T) {

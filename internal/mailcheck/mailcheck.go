@@ -4,14 +4,17 @@ import (
 	"bufio"
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -19,10 +22,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
+	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
 )
 
 const (
+	SchemaVersion    = "1.0"
 	SeverityInfo     = "info"
 	SeverityWarn     = "warn"
 	SeverityCritical = "critical"
@@ -50,53 +56,66 @@ var defaultDomainBLServers = []string{
 }
 
 type Options struct {
-	Domain          string
-	Profiles        []string
-	DKIMSelectors   []string
-	DKIMExplicit    bool
-	RBLServers      []string
-	DomainBLServers []string
-	Timeout         time.Duration
-	Strict          bool
-	CheckRBL        bool
-	CheckReputation bool
-	CheckMTASTS     bool
-	CheckTLSRPT     bool
-	CheckBIMI       bool
-	CheckSMTP       bool
-	SMTPHosts       []string
-	SMTPPort        int
-	SMTPPorts       []int
-	CheckOpenRelay  bool
-	CheckMDA        bool
-	MDAHosts        []string
-	MDAExplicit     bool
-	MDAPorts        []int
+	Domain              string
+	Profiles            []string
+	DKIMSelectors       []string
+	DKIMExplicit        bool
+	RBLServers          []string
+	DomainBLServers     []string
+	Timeout             time.Duration
+	Strict              bool
+	CheckRBL            bool
+	CheckReputation     bool
+	CheckMTASTS         bool
+	CheckTLSRPT         bool
+	CheckBIMI           bool
+	CheckSMTP           bool
+	SMTPHosts           []string
+	SMTPPort            int
+	SMTPPorts           []int
+	CheckOpenRelay      bool
+	CheckMDA            bool
+	MDAHosts            []string
+	MDAExplicit         bool
+	MDAPorts            []int
+	ResolverAddress     string
+	AllowPrivateTargets bool
+	DisableDNSSEC       bool
+	DisableDANE         bool
+	resolverLabel       string
+	configError         string
+	rawDNSServer        string
+	rawDNSError         string
 }
 
 type Report struct {
-	Domain       string           `json:"domain" yaml:"domain"`
-	Status       string           `json:"status" yaml:"status"`
-	Resolver     string           `json:"resolver" yaml:"resolver"`
-	Profiles     []string         `json:"profiles,omitempty" yaml:"profiles,omitempty"`
-	DurationMS   int64            `json:"duration_ms" yaml:"duration_ms"`
-	MX           []MXRecord       `json:"mx" yaml:"mx"`
-	SPF          SPFReport        `json:"spf" yaml:"spf"`
-	DKIM         []DKIMReport     `json:"dkim" yaml:"dkim"`
-	DMARC        DMARCReport      `json:"dmarc" yaml:"dmarc"`
-	MTASTS       MTASTSReport     `json:"mta_sts" yaml:"mta_sts"`
-	TLSRPT       TLSRPTReport     `json:"tls_rpt" yaml:"tls_rpt"`
-	BIMI         BIMIReport       `json:"bimi" yaml:"bimi"`
-	PTR          []PTRReport      `json:"ptr" yaml:"ptr"`
-	RBL          []RBLReport      `json:"rbl" yaml:"rbl"`
-	DomainBL     []DomainBLReport `json:"domain_bl" yaml:"domain_bl"`
-	SMTP         []SMTPReport     `json:"smtp" yaml:"smtp"`
-	MDA          []MDAReport      `json:"mda" yaml:"mda"`
-	Findings     []Finding        `json:"findings" yaml:"findings"`
-	Error        string           `json:"error,omitempty" yaml:"error,omitempty"`
-	GeneratedAt  time.Time        `json:"generated_at" yaml:"generated_at"`
-	RecordCounts RecordCounts     `json:"record_counts" yaml:"record_counts"`
-	Summary      ReportSummary    `json:"summary" yaml:"summary"`
+	SchemaVersion      string           `json:"schema_version" yaml:"schema_version"`
+	Domain             string           `json:"domain" yaml:"domain"`
+	Status             string           `json:"status" yaml:"status"`
+	PostureStatus      string           `json:"posture_status" yaml:"posture_status"`
+	AvailabilityStatus string           `json:"availability_status" yaml:"availability_status"`
+	Resolver           string           `json:"resolver" yaml:"resolver"`
+	Profiles           []string         `json:"profiles,omitempty" yaml:"profiles,omitempty"`
+	DurationMS         int64            `json:"duration_ms" yaml:"duration_ms"`
+	MX                 []MXRecord       `json:"mx" yaml:"mx"`
+	SPF                SPFReport        `json:"spf" yaml:"spf"`
+	DKIM               []DKIMReport     `json:"dkim" yaml:"dkim"`
+	DMARC              DMARCReport      `json:"dmarc" yaml:"dmarc"`
+	DNSSEC             DNSSECReport     `json:"dnssec" yaml:"dnssec"`
+	DANE               []DANEReport     `json:"dane" yaml:"dane"`
+	MTASTS             MTASTSReport     `json:"mta_sts" yaml:"mta_sts"`
+	TLSRPT             TLSRPTReport     `json:"tls_rpt" yaml:"tls_rpt"`
+	BIMI               BIMIReport       `json:"bimi" yaml:"bimi"`
+	PTR                []PTRReport      `json:"ptr" yaml:"ptr"`
+	RBL                []RBLReport      `json:"rbl" yaml:"rbl"`
+	DomainBL           []DomainBLReport `json:"domain_bl" yaml:"domain_bl"`
+	SMTP               []SMTPReport     `json:"smtp" yaml:"smtp"`
+	MDA                []MDAReport      `json:"mda" yaml:"mda"`
+	Findings           []Finding        `json:"findings" yaml:"findings"`
+	Error              string           `json:"error,omitempty" yaml:"error,omitempty"`
+	GeneratedAt        time.Time        `json:"generated_at" yaml:"generated_at"`
+	RecordCounts       RecordCounts     `json:"record_counts" yaml:"record_counts"`
+	Summary            ReportSummary    `json:"summary" yaml:"summary"`
 }
 
 type RecordCounts struct {
@@ -122,6 +141,7 @@ type ReportSummary struct {
 }
 
 type Finding struct {
+	Code     string `json:"code" yaml:"code"`
 	Severity string `json:"severity" yaml:"severity"`
 	Scope    string `json:"scope" yaml:"scope"`
 	Message  string `json:"message" yaml:"message"`
@@ -157,17 +177,28 @@ type DKIMReport struct {
 }
 
 type DMARCReport struct {
-	Records   []string          `json:"records" yaml:"records"`
-	Present   bool              `json:"present" yaml:"present"`
-	Valid     bool              `json:"valid" yaml:"valid"`
-	Policy    string            `json:"policy,omitempty" yaml:"policy,omitempty"`
-	SubPolicy string            `json:"subdomain_policy,omitempty" yaml:"subdomain_policy,omitempty"`
-	Pct       int               `json:"pct" yaml:"pct"`
-	Tags      map[string]string `json:"tags,omitempty" yaml:"tags,omitempty"`
-	RUA       []string          `json:"rua,omitempty" yaml:"rua,omitempty"`
-	RUF       []string          `json:"ruf,omitempty" yaml:"ruf,omitempty"`
-	Warnings  []string          `json:"warnings,omitempty" yaml:"warnings,omitempty"`
-	Errors    []string          `json:"errors,omitempty" yaml:"errors,omitempty"`
+	Records            []string          `json:"records" yaml:"records"`
+	Present            bool              `json:"present" yaml:"present"`
+	Valid              bool              `json:"valid" yaml:"valid"`
+	RFC                string            `json:"rfc" yaml:"rfc"`
+	Policy             string            `json:"policy,omitempty" yaml:"policy,omitempty"`
+	EffectivePolicy    string            `json:"effective_policy,omitempty" yaml:"effective_policy,omitempty"`
+	AppliedPolicyTag   string            `json:"applied_policy_tag,omitempty" yaml:"applied_policy_tag,omitempty"`
+	SubPolicy          string            `json:"subdomain_policy,omitempty" yaml:"subdomain_policy,omitempty"`
+	NonexistentPolicy  string            `json:"nonexistent_policy,omitempty" yaml:"nonexistent_policy,omitempty"`
+	PolicyDomain       string            `json:"policy_domain,omitempty" yaml:"policy_domain,omitempty"`
+	QueryName          string            `json:"query_name,omitempty" yaml:"query_name,omitempty"`
+	Inherited          bool              `json:"inherited" yaml:"inherited"`
+	PSD                string            `json:"psd,omitempty" yaml:"psd,omitempty"`
+	Testing            bool              `json:"testing" yaml:"testing"`
+	AuthorDomainExists *bool             `json:"author_domain_exists,omitempty" yaml:"author_domain_exists,omitempty"`
+	TreeWalk           []string          `json:"tree_walk,omitempty" yaml:"tree_walk,omitempty"`
+	Pct                int               `json:"pct" yaml:"pct"`
+	Tags               map[string]string `json:"tags,omitempty" yaml:"tags,omitempty"`
+	RUA                []string          `json:"rua,omitempty" yaml:"rua,omitempty"`
+	RUF                []string          `json:"ruf,omitempty" yaml:"ruf,omitempty"`
+	Warnings           []string          `json:"warnings,omitempty" yaml:"warnings,omitempty"`
+	Errors             []string          `json:"errors,omitempty" yaml:"errors,omitempty"`
 }
 
 type MTASTSReport struct {
@@ -195,15 +226,21 @@ type TLSRPTReport struct {
 }
 
 type BIMIReport struct {
-	Records      []string          `json:"records" yaml:"records"`
-	Present      bool              `json:"present" yaml:"present"`
-	Valid        bool              `json:"valid" yaml:"valid"`
-	LogoURL      string            `json:"logo_url,omitempty" yaml:"logo_url,omitempty"`
-	AuthorityURL string            `json:"authority_url,omitempty" yaml:"authority_url,omitempty"`
-	Declined     bool              `json:"declined" yaml:"declined"`
-	Tags         map[string]string `json:"tags,omitempty" yaml:"tags,omitempty"`
-	Warning      string            `json:"warning,omitempty" yaml:"warning,omitempty"`
-	Error        string            `json:"error,omitempty" yaml:"error,omitempty"`
+	Records          []string          `json:"records" yaml:"records"`
+	Present          bool              `json:"present" yaml:"present"`
+	Valid            bool              `json:"valid" yaml:"valid"`
+	LogoURL          string            `json:"logo_url,omitempty" yaml:"logo_url,omitempty"`
+	AuthorityURL     string            `json:"authority_url,omitempty" yaml:"authority_url,omitempty"`
+	Declined         bool              `json:"declined" yaml:"declined"`
+	LogoFetched      bool              `json:"logo_fetched" yaml:"logo_fetched"`
+	LogoValid        bool              `json:"logo_valid" yaml:"logo_valid"`
+	LogoMediaType    string            `json:"logo_media_type,omitempty" yaml:"logo_media_type,omitempty"`
+	AuthorityFetched bool              `json:"authority_fetched" yaml:"authority_fetched"`
+	AuthorityValid   bool              `json:"authority_valid" yaml:"authority_valid"`
+	AssetError       string            `json:"asset_error,omitempty" yaml:"asset_error,omitempty"`
+	Tags             map[string]string `json:"tags,omitempty" yaml:"tags,omitempty"`
+	Warning          string            `json:"warning,omitempty" yaml:"warning,omitempty"`
+	Error            string            `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 type PTRReport struct {
@@ -217,6 +254,7 @@ type RBLReport struct {
 	IP       string   `json:"ip" yaml:"ip"`
 	ListedOn []string `json:"listed_on" yaml:"listed_on"`
 	CleanOn  []string `json:"clean_on" yaml:"clean_on"`
+	ErrorOn  []string `json:"error_on,omitempty" yaml:"error_on,omitempty"`
 	Errors   []string `json:"errors,omitempty" yaml:"errors,omitempty"`
 }
 
@@ -248,8 +286,40 @@ type SMTPReport struct {
 	TLSVersion        string    `json:"tls_version,omitempty" yaml:"tls_version,omitempty"`
 	CertNotAfter      time.Time `json:"cert_not_after,omitempty" yaml:"cert_not_after,omitempty"`
 	CertDaysRemaining int       `json:"cert_days_remaining,omitempty" yaml:"cert_days_remaining,omitempty"`
+	CertSHA256        string    `json:"cert_sha256,omitempty" yaml:"cert_sha256,omitempty"`
 	Error             string    `json:"error,omitempty" yaml:"error,omitempty"`
 	Warning           string    `json:"warning,omitempty" yaml:"warning,omitempty"`
+	certificate       *x509.Certificate
+}
+
+type DNSSECReport struct {
+	Checked  bool   `json:"checked" yaml:"checked"`
+	Signed   bool   `json:"signed" yaml:"signed"`
+	Secure   bool   `json:"secure" yaml:"secure"`
+	Resolver string `json:"resolver,omitempty" yaml:"resolver,omitempty"`
+	Error    string `json:"error,omitempty" yaml:"error,omitempty"`
+}
+
+type TLSARecord struct {
+	Usage           uint8  `json:"usage" yaml:"usage"`
+	Selector        uint8  `json:"selector" yaml:"selector"`
+	MatchingType    uint8  `json:"matching_type" yaml:"matching_type"`
+	AssociationData string `json:"association_data" yaml:"association_data"`
+	Valid           bool   `json:"valid" yaml:"valid"`
+	Matched         bool   `json:"matched" yaml:"matched"`
+}
+
+type DANEReport struct {
+	Host         string       `json:"host" yaml:"host"`
+	Port         int          `json:"port" yaml:"port"`
+	QueryName    string       `json:"query_name" yaml:"query_name"`
+	Present      bool         `json:"present" yaml:"present"`
+	Valid        bool         `json:"valid" yaml:"valid"`
+	DNSSECSecure bool         `json:"dnssec_secure" yaml:"dnssec_secure"`
+	Matched      bool         `json:"matched" yaml:"matched"`
+	Records      []TLSARecord `json:"records,omitempty" yaml:"records,omitempty"`
+	Error        string       `json:"error,omitempty" yaml:"error,omitempty"`
+	Warning      string       `json:"warning,omitempty" yaml:"warning,omitempty"`
 }
 
 type MDAReport struct {
@@ -276,7 +346,54 @@ type resolver interface {
 }
 
 func Run(ctx context.Context, opts Options) Report {
-	return run(ctx, opts, net.DefaultResolver)
+	if strings.TrimSpace(opts.ResolverAddress) == "" {
+		opts.resolverLabel = "system"
+		opts.rawDNSServer, opts.rawDNSError = systemDNSServer()
+		return run(ctx, opts, net.DefaultResolver)
+	}
+	r, endpoint, err := newCustomResolver(opts.ResolverAddress)
+	if err != nil {
+		opts.resolverLabel = strings.TrimSpace(opts.ResolverAddress)
+		opts.configError = "invalid resolver: " + err.Error()
+		return run(ctx, opts, net.DefaultResolver)
+	}
+	opts.resolverLabel = endpoint
+	opts.rawDNSServer = endpoint
+	return run(ctx, opts, r)
+}
+
+func systemDNSServer() (string, string) {
+	config, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if err != nil {
+		return "", err.Error()
+	}
+	if len(config.Servers) == 0 {
+		return "", "system resolver configuration contains no name servers"
+	}
+	return net.JoinHostPort(config.Servers[0], config.Port), ""
+}
+
+func newCustomResolver(raw string) (*net.Resolver, string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, "", fmt.Errorf("address is empty")
+	}
+	endpoint := raw
+	if ip := net.ParseIP(strings.Trim(raw, "[]")); ip != nil {
+		endpoint = net.JoinHostPort(ip.String(), "53")
+	} else if _, _, err := net.SplitHostPort(raw); err != nil {
+		if strings.Contains(raw, ":") {
+			return nil, "", fmt.Errorf("expected an IP address or host:port")
+		}
+		endpoint = net.JoinHostPort(raw, "53")
+	}
+	dialer := &net.Dialer{}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, endpoint)
+		},
+	}, endpoint, nil
 }
 
 func run(ctx context.Context, opts Options, r resolver) Report {
@@ -313,11 +430,12 @@ func run(ctx context.Context, opts Options, r resolver) Report {
 	defer cancel()
 
 	rep := Report{
-		Domain:      domain,
-		Status:      "ok",
-		Resolver:    "system",
-		Profiles:    opts.Profiles,
-		GeneratedAt: time.Now().UTC(),
+		SchemaVersion: SchemaVersion,
+		Domain:        domain,
+		Status:        "ok",
+		Resolver:      opts.resolverLabel,
+		Profiles:      opts.Profiles,
+		GeneratedAt:   time.Now().UTC(),
 	}
 	if domain == "" {
 		rep.Error = "domain is required"
@@ -329,6 +447,11 @@ func run(ctx context.Context, opts Options, r resolver) Report {
 		rep.Error = "invalid domain: " + domain
 		rep.Status = SeverityError
 		rep.Findings = append(rep.Findings, Finding{Severity: SeverityError, Scope: "input", Message: rep.Error})
+		return finalize(rep, start)
+	}
+	if opts.configError != "" {
+		rep.Error = opts.configError
+		rep.Findings = append(rep.Findings, Finding{Severity: SeverityError, Scope: "input", Message: opts.configError})
 		return finalize(rep, start)
 	}
 
@@ -348,6 +471,10 @@ func run(ctx context.Context, opts Options, r resolver) Report {
 		if mx.Error != "" {
 			rep.Findings = append(rep.Findings, Finding{Severity: SeverityWarn, Scope: "mx", Message: fmt.Sprintf("%s does not resolve: %s", mx.Host, mx.Error)})
 		}
+	}
+	if !opts.DisableDNSSEC && (opts.rawDNSServer != "" || opts.rawDNSError != "") {
+		rep.DNSSEC = checkDNSSEC(ctx, opts.rawDNSServer, opts.rawDNSError, domain, opts.Timeout)
+		rep.Findings = append(rep.Findings, dnsSECFindings(rep.DNSSEC)...)
 	}
 
 	rep.SPF = checkSPF(ctx, r, domain)
@@ -384,7 +511,7 @@ func run(ctx context.Context, opts Options, r resolver) Report {
 	}
 
 	if opts.CheckMTASTS {
-		rep.MTASTS = checkMTASTS(ctx, r, domain, opts.Timeout)
+		rep.MTASTS = checkMTASTSWithTargetPolicy(ctx, r, domain, opts.Timeout, opts.AllowPrivateTargets)
 		applyMTASTSMXCoverage(&rep.MTASTS, rep.MX)
 		if rep.MTASTS.TXTPresent {
 			rep.RecordCounts.MTASTS = 1
@@ -398,6 +525,7 @@ func run(ctx context.Context, opts Options, r resolver) Report {
 	}
 	if opts.CheckBIMI {
 		rep.BIMI = checkBIMI(ctx, r, domain, rep.DMARC)
+		inspectBIMIAssets(ctx, r, &rep.BIMI, opts.Timeout, opts.AllowPrivateTargets)
 		rep.RecordCounts.BIMI = len(rep.BIMI.Records)
 		rep.Findings = append(rep.Findings, bimiFindings(rep.BIMI)...)
 	}
@@ -441,14 +569,18 @@ func run(ctx context.Context, opts Options, r resolver) Report {
 	}
 
 	if opts.CheckSMTP {
-		rep.SMTP = checkSMTP(ctx, rep.MX, opts.SMTPHosts, opts.SMTPPorts, opts.Timeout, opts.CheckOpenRelay)
+		rep.SMTP = checkSMTPWithTargetPolicy(ctx, r, rep.MX, opts.SMTPHosts, opts.SMTPPorts, opts.Timeout, opts.CheckOpenRelay, opts.AllowPrivateTargets)
 		rep.RecordCounts.SMTP = len(rep.SMTP)
 		rep.Findings = append(rep.Findings, smtpFindings(rep.SMTP, opts.Strict)...)
 	}
 	if opts.CheckMDA {
-		rep.MDA = checkMDA(ctx, domain, opts.MDAHosts, opts.MDAPorts, opts.Timeout, opts.MDAExplicit)
+		rep.MDA = checkMDAWithTargetPolicy(ctx, r, domain, opts.MDAHosts, opts.MDAPorts, opts.Timeout, opts.MDAExplicit, opts.AllowPrivateTargets)
 		rep.RecordCounts.MDA = len(rep.MDA)
 		rep.Findings = append(rep.Findings, mdaFindings(rep.MDA, opts.MDAExplicit, opts.Strict)...)
+	}
+	if !opts.DisableDANE && (opts.rawDNSServer != "" || opts.rawDNSError != "") {
+		rep.DANE = checkDANE(ctx, opts.rawDNSServer, opts.rawDNSError, rep.MX, rep.SMTP, opts.Timeout)
+		rep.Findings = append(rep.Findings, daneFindings(rep.DANE)...)
 	}
 
 	return finalize(rep, start)
@@ -456,18 +588,150 @@ func run(ctx context.Context, opts Options, r resolver) Report {
 
 func finalize(rep Report, start time.Time) Report {
 	rep.DurationMS = time.Since(start).Milliseconds()
-	rep.Summary = summarize(rep.Findings)
-	switch {
-	case rep.Summary.Error > 0:
-		rep.Status = SeverityError
-	case rep.Summary.Critical > 0:
-		rep.Status = SeverityCritical
-	case rep.Summary.Warn > 0:
-		rep.Status = SeverityWarn
-	default:
-		rep.Status = "ok"
+	for index := range rep.Findings {
+		if rep.Findings[index].Code == "" {
+			rep.Findings[index].Code = findingCode(rep.Findings[index])
+		}
 	}
+	rep.Summary = summarize(rep.Findings)
+	rep.PostureStatus = findingStatus(rep.Findings, false)
+	if len(rep.SMTP) == 0 && len(rep.MDA) == 0 {
+		rep.AvailabilityStatus = "not_checked"
+	} else {
+		rep.AvailabilityStatus = findingStatus(rep.Findings, true)
+	}
+	rep.Status = worstStatus(rep.PostureStatus, rep.AvailabilityStatus)
 	return rep
+}
+
+func findingStatus(findings []Finding, availability bool) string {
+	status := "ok"
+	for _, finding := range findings {
+		active := finding.Scope == "smtp" || finding.Scope == "mda"
+		if active != availability {
+			continue
+		}
+		status = worstStatus(status, finding.Severity)
+	}
+	return status
+}
+
+func worstStatus(statuses ...string) string {
+	rank := map[string]int{"not_checked": -1, "ok": 0, SeverityInfo: 0, SeverityWarn: 1, SeverityCritical: 2, SeverityError: 3}
+	worst := "ok"
+	for _, status := range statuses {
+		if rank[status] > rank[worst] {
+			worst = status
+		}
+	}
+	return worst
+}
+
+func findingCode(finding Finding) string {
+	message := strings.ToLower(finding.Message)
+	prefix := "MAILOPS_" + strings.ToUpper(strings.NewReplacer("-", "_", " ", "_").Replace(finding.Scope))
+	suffix := "_CHECK"
+	switch finding.Scope {
+	case "input":
+		if strings.Contains(message, "required") {
+			suffix = "_DOMAIN_REQUIRED"
+		} else {
+			suffix = "_INVALID_DOMAIN"
+		}
+	case "mx":
+		switch {
+		case strings.Contains(message, "lookup failed"):
+			suffix = "_LOOKUP_FAILED"
+		case strings.Contains(message, "no mx"):
+			suffix = "_MISSING"
+		case strings.Contains(message, "null mx"):
+			suffix = "_NULL"
+		default:
+			suffix = "_HOST_UNRESOLVED"
+		}
+	case "spf":
+		switch {
+		case strings.Contains(message, "no spf"):
+			suffix = "_MISSING"
+		case strings.Contains(message, "multiple"):
+			suffix = "_MULTIPLE"
+		case strings.Contains(message, "lookup"):
+			suffix = "_LOOKUP"
+		case strings.Contains(message, "+all"):
+			suffix = "_ALLOW_ALL"
+		default:
+			suffix = "_INVALID"
+		}
+	case "dmarc":
+		switch {
+		case strings.Contains(message, "no dmarc"):
+			suffix = "_MISSING"
+		case strings.Contains(message, "multiple"):
+			suffix = "_MULTIPLE"
+		case strings.Contains(message, "lookup failed"):
+			suffix = "_LOOKUP_FAILED"
+		case strings.Contains(message, "p=none"):
+			suffix = "_POLICY_NONE"
+		case strings.Contains(message, "quarantine"):
+			suffix = "_POLICY_QUARANTINE"
+		default:
+			suffix = "_INVALID"
+		}
+	case "dkim":
+		if strings.Contains(message, "no valid") || strings.Contains(message, "missing") {
+			suffix = "_MISSING"
+		} else {
+			suffix = "_INVALID"
+		}
+	case "rbl", "reputation":
+		if strings.Contains(message, "listed") {
+			suffix = "_LISTED"
+		} else {
+			suffix = "_LOOKUP_FAILED"
+		}
+	case "ptr":
+		if strings.Contains(message, "forward-confirmed") {
+			suffix = "_FC_RDNS_FAILED"
+		} else {
+			suffix = "_MISSING"
+		}
+	case "smtp", "mda":
+		if strings.Contains(message, "relay") {
+			suffix = "_OPEN_RELAY"
+		} else if strings.Contains(message, "certificate") {
+			suffix = "_CERTIFICATE"
+		} else if strings.Contains(message, "tls") {
+			suffix = "_TLS"
+		} else {
+			suffix = "_UNAVAILABLE"
+		}
+	case "mta-sts":
+		suffix = "_POLICY"
+	case "tls-rpt":
+		suffix = "_RECORD"
+	case "bimi":
+		suffix = "_RECORD"
+	case "dnssec":
+		if strings.Contains(message, "check failed") {
+			suffix = "_LOOKUP_FAILED"
+		} else if strings.Contains(message, "not authenticate") {
+			suffix = "_NOT_SECURE"
+		} else {
+			suffix = "_UNSIGNED"
+		}
+	case "dane":
+		switch {
+		case strings.Contains(message, "lookup failed"):
+			suffix = "_LOOKUP_FAILED"
+		case strings.Contains(message, "do not match"):
+			suffix = "_CERT_MISMATCH"
+		case strings.Contains(message, "not protected"):
+			suffix = "_DNSSEC_REQUIRED"
+		default:
+			suffix = "_INVALID_TLSA"
+		}
+	}
+	return prefix + suffix
 }
 
 func summarize(findings []Finding) ReportSummary {
@@ -539,12 +803,16 @@ func checkSPF(ctx context.Context, r resolver, domain string) SPFReport {
 		return rep
 	}
 	parsed := parseSPFRecord(rep.Records[0])
-	rep.Valid = true
+	rep.Valid = len(parsed.Errors) == 0
 	rep.AllMechanism = parsed.All
 	rep.Warnings = append(rep.Warnings, parsed.Warnings...)
+	rep.Errors = append(rep.Errors, parsed.Errors...)
 	count, countErrs := countSPFLookups(ctx, r, domain, map[string]bool{}, 0)
 	rep.EstimatedLookups = count
 	rep.Errors = append(rep.Errors, countErrs...)
+	if len(countErrs) > 0 {
+		rep.Valid = false
+	}
 	if count > 10 {
 		rep.Valid = false
 		rep.Errors = append(rep.Errors, fmt.Sprintf("SPF exceeds 10 DNS lookup limit (%d lookups)", count))
@@ -556,18 +824,37 @@ type parsedSPF struct {
 	All      string
 	Redirect bool
 	Warnings []string
+	Errors   []string
 }
 
 func parseSPFRecord(record string) parsedSPF {
 	var out parsedSPF
-	for _, field := range strings.Fields(record) {
+	redirects := 0
+	allSeen := false
+	for index, field := range strings.Fields(record) {
+		if index == 0 {
+			continue
+		}
 		lower := strings.ToLower(field)
 		if strings.HasPrefix(lower, "redirect=") {
 			out.Redirect = true
+			redirects++
+			if strings.TrimSpace(field[len("redirect="):]) == "" {
+				out.Errors = append(out.Errors, "SPF redirect modifier has an empty target")
+			}
+			continue
+		}
+		if strings.Contains(lower, "=") {
+			// Unknown modifiers are ignored by SPF receivers.
+			continue
 		}
 		mechanism := strings.TrimLeft(lower, "+-~?")
+		if allSeen {
+			out.Warnings = append(out.Warnings, "SPF terms after all are unreachable: "+field)
+		}
 		if mechanism == "all" {
 			out.All = lower
+			allSeen = true
 			switch lower {
 			case "+all":
 				out.Warnings = append(out.Warnings, "SPF uses +all and permits every sender")
@@ -576,7 +863,17 @@ func parseSPFRecord(record string) parsedSPF {
 			case "~all":
 				out.Warnings = append(out.Warnings, "SPF uses ~all softfail; -all is stricter")
 			}
+			continue
 		}
+		if err := validateSPFMechanism(field); err != nil {
+			out.Errors = append(out.Errors, err.Error())
+		}
+	}
+	if redirects > 1 {
+		out.Errors = append(out.Errors, "SPF has multiple redirect modifiers")
+	}
+	if out.All != "" && out.Redirect {
+		out.Warnings = append(out.Warnings, "SPF redirect modifier is ignored because an all mechanism is present")
 	}
 	if out.All == "" {
 		if !out.Redirect {
@@ -584,6 +881,56 @@ func parseSPFRecord(record string) parsedSPF {
 		}
 	}
 	return out
+}
+
+func validateSPFMechanism(field string) error {
+	mechanism := strings.TrimLeft(strings.ToLower(field), "+-~?")
+	switch {
+	case mechanism == "all", mechanism == "a", mechanism == "mx", mechanism == "ptr":
+		return nil
+	case strings.HasPrefix(mechanism, "a:") || strings.HasPrefix(mechanism, "a/"), strings.HasPrefix(mechanism, "mx:") || strings.HasPrefix(mechanism, "mx/"):
+		return nil
+	case strings.HasPrefix(mechanism, "include:"):
+		if strings.TrimSpace(mechanism[len("include:"):]) == "" {
+			return fmt.Errorf("SPF include mechanism has an empty target")
+		}
+		return nil
+	case strings.HasPrefix(mechanism, "exists:"):
+		if strings.TrimSpace(mechanism[len("exists:"):]) == "" {
+			return fmt.Errorf("SPF exists mechanism has an empty target")
+		}
+		return nil
+	case strings.HasPrefix(mechanism, "ptr:"):
+		return nil
+	case strings.HasPrefix(mechanism, "ip4:"):
+		value := mechanism[len("ip4:"):]
+		if strings.Contains(value, "/") {
+			ip, _, err := net.ParseCIDR(value)
+			if err != nil || ip.To4() == nil {
+				return fmt.Errorf("SPF ip4 mechanism is invalid: %s", field)
+			}
+			return nil
+		}
+		if ip := net.ParseIP(value); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("SPF ip4 mechanism is invalid: %s", field)
+		}
+		return nil
+	case strings.HasPrefix(mechanism, "ip6:"):
+		value := mechanism[len("ip6:"):]
+		if strings.Contains(value, "/") {
+			ip, _, err := net.ParseCIDR(value)
+			if err != nil || ip.To4() != nil {
+				return fmt.Errorf("SPF ip6 mechanism is invalid: %s", field)
+			}
+			return nil
+		}
+		if ip := net.ParseIP(value); ip == nil || ip.To4() != nil {
+			return fmt.Errorf("SPF ip6 mechanism is invalid: %s", field)
+		}
+		return nil
+	default:
+		return fmt.Errorf("SPF contains unknown mechanism: %s", field)
+	}
 }
 
 func countSPFLookups(ctx context.Context, r resolver, domain string, seen map[string]bool, depth int) (int, []string) {
@@ -601,16 +948,22 @@ func countSPFLookups(ctx context.Context, r resolver, domain string, seen map[st
 	if err != nil {
 		return 0, []string{fmt.Sprintf("%s SPF lookup failed: %s", domain, err)}
 	}
-	var record string
+	var records []string
 	for _, txt := range txts {
 		if hasSPFVersion(txt) {
-			record = txt
-			break
+			records = append(records, txt)
 		}
 	}
-	if record == "" {
+	if len(records) == 0 {
+		if depth > 0 {
+			return 0, []string{domain + " has no SPF record referenced by include/redirect"}
+		}
 		return 0, nil
 	}
+	if len(records) > 1 {
+		return 0, []string{domain + " has multiple SPF records referenced by include/redirect"}
+	}
+	record := records[0]
 
 	total := 0
 	var errs []string
@@ -671,68 +1024,228 @@ func spfFindings(rep SPFReport) []Finding {
 	return out
 }
 
+type dmarcCandidate struct {
+	domain string
+	raw    string
+	tags   map[string]string
+	valid  bool
+}
+
 func checkDMARC(ctx context.Context, r resolver, domain string) DMARCReport {
-	name := "_dmarc." + domain
-	txts, err := lookupTXT(ctx, r, name)
-	rep := DMARCReport{Pct: 100}
-	if err != nil {
-		if !dnsNotFound(err) {
-			rep.Errors = append(rep.Errors, "DMARC TXT lookup failed: "+err.Error())
+	rep := DMARCReport{RFC: "RFC 9989", Pct: 100}
+	targets := dmarcTreeTargets(domain)
+	candidates := make([]dmarcCandidate, 0, len(targets))
+
+	for index, target := range targets {
+		queryName := "_dmarc." + target
+		rep.TreeWalk = append(rep.TreeWalk, queryName)
+		txts, err := lookupTXT(ctx, r, queryName)
+		if err != nil {
+			if dnsNotFound(err) {
+				continue
+			}
+			rep.Errors = append(rep.Errors, fmt.Sprintf("DMARC TXT lookup failed for %s: %s", queryName, err))
+			break
 		}
-		return rep
-	}
-	for _, txt := range txts {
-		if hasTagVersion(txt, "DMARC1") {
-			rep.Records = append(rep.Records, txt)
+
+		var records []string
+		for _, txt := range txts {
+			if isDMARCRecord(txt) {
+				records = append(records, txt)
+				rep.Records = append(rep.Records, txt)
+			}
+		}
+		if len(records) == 0 {
+			continue
+		}
+		if len(records) > 1 {
+			rep.Errors = append(rep.Errors, "multiple DMARC records found at "+queryName+"; all were discarded")
+			continue
+		}
+
+		tags := parseTags(records[0])
+		if duplicates := duplicateTagKeys(records[0]); len(duplicates) > 0 {
+			rep.Errors = append(rep.Errors, "DMARC record has duplicate tag(s) at "+queryName+": "+strings.Join(duplicates, ", "))
+			continue
+		}
+		policy := strings.ToLower(tags["p"])
+		valid := validDMARCPolicy(policy)
+		rua := parseMailtoList(tags["rua"])
+		if !valid {
+			rep.Errors = append(rep.Errors, "DMARC policy p= is missing or invalid at "+queryName)
+			// RFC 9989 treats an invalid policy as p=none when a valid rua
+			// destination remains available; otherwise the record is discarded.
+			if len(rua) == 0 {
+				continue
+			}
+		}
+
+		candidate := dmarcCandidate{domain: target, raw: records[0], tags: tags, valid: valid}
+		candidates = append(candidates, candidate)
+		psd := strings.ToLower(tags["psd"])
+		if psd != "" && psd != "n" && psd != "y" && psd != "u" {
+			rep.Warnings = append(rep.Warnings, "DMARC psd tag is invalid at "+queryName+" and was ignored")
+			psd = ""
+		}
+		if index == 0 {
+			applyDMARCCandidate(ctx, r, domain, candidate, &rep)
+			return rep
+		}
+		if psd == "n" {
+			applyDMARCCandidate(ctx, r, domain, candidate, &rep)
+			return rep
+		}
+		if psd == "y" {
+			selected := candidate
+			organizationalDomain := targets[index-1]
+			for _, prior := range candidates[:len(candidates)-1] {
+				if strings.EqualFold(prior.domain, organizationalDomain) {
+					selected = prior
+					break
+				}
+			}
+			applyDMARCCandidate(ctx, r, domain, selected, &rep)
+			return rep
 		}
 	}
-	rep.Present = len(rep.Records) > 0
-	if len(rep.Records) != 1 {
-		if len(rep.Records) > 1 {
-			rep.Errors = append(rep.Errors, "multiple DMARC records found")
-		}
-		return rep
+
+	if len(candidates) > 0 {
+		// With no explicit PSD boundary, the record with the fewest labels
+		// is the organizational-domain policy selected by the tree walk.
+		applyDMARCCandidate(ctx, r, domain, candidates[len(candidates)-1], &rep)
 	}
-	tags := parseTags(rep.Records[0])
+	return rep
+}
+
+func dmarcTreeTargets(domain string) []string {
+	labels := strings.Split(strings.TrimSuffix(domain, "."), ".")
+	if len(labels) == 0 || labels[0] == "" {
+		return nil
+	}
+	targets := []string{strings.Join(labels, ".")}
+	if len(labels) > 8 {
+		labels = labels[len(labels)-7:]
+	} else {
+		labels = labels[1:]
+	}
+	for len(labels) > 0 && len(targets) < 8 {
+		targets = append(targets, strings.Join(labels, "."))
+		labels = labels[1:]
+	}
+	return targets
+}
+
+func isDMARCRecord(record string) bool {
+	first, _, _ := strings.Cut(strings.TrimSpace(record), ";")
+	key, value, ok := strings.Cut(strings.TrimSpace(first), "=")
+	return ok && strings.EqualFold(strings.TrimSpace(key), "v") && strings.TrimSpace(value) == "DMARC1"
+}
+
+func validDMARCPolicy(policy string) bool {
+	return policy == "none" || policy == "quarantine" || policy == "reject"
+}
+
+func applyDMARCCandidate(ctx context.Context, r resolver, authorDomain string, candidate dmarcCandidate, rep *DMARCReport) {
+	tags := candidate.tags
+	rep.Present = true
+	rep.Valid = candidate.valid
 	rep.Tags = tags
+	rep.PolicyDomain = candidate.domain
+	rep.QueryName = "_dmarc." + candidate.domain
+	rep.Inherited = !strings.EqualFold(authorDomain, candidate.domain)
 	rep.Policy = strings.ToLower(tags["p"])
 	rep.SubPolicy = strings.ToLower(tags["sp"])
-	pctValid := true
-	if rawPct, present := tags["pct"]; present {
-		pct, err := strconv.Atoi(rawPct)
-		if err != nil || pct < 0 || pct > 100 {
-			pctValid = false
-			rep.Errors = append(rep.Errors, "DMARC pct must be an integer from 0 to 100")
-		} else {
-			rep.Pct = pct
-		}
-	}
+	rep.NonexistentPolicy = strings.ToLower(tags["np"])
+	rep.PSD = strings.ToLower(tags["psd"])
 	rep.RUA = parseMailtoList(tags["rua"])
 	rep.RUF = parseMailtoList(tags["ruf"])
-	rep.Valid = pctValid && (rep.Policy == "none" || rep.Policy == "quarantine" || rep.Policy == "reject")
-	if !rep.Valid {
-		rep.Errors = append(rep.Errors, "DMARC policy p= is missing or invalid")
+
+	if !candidate.valid && len(rep.RUA) > 0 {
+		rep.EffectivePolicy = "none"
+		rep.AppliedPolicyTag = "p"
+	} else if rep.Inherited {
+		rep.EffectivePolicy, rep.AppliedPolicyTag = inheritedDMARCPolicy(ctx, r, authorDomain, rep)
+	} else {
+		rep.EffectivePolicy = rep.Policy
+		rep.AppliedPolicyTag = "p"
 	}
-	if rep.Policy == "none" {
-		rep.Warnings = append(rep.Warnings, "DMARC policy is p=none")
+
+	if rawPct, present := tags["pct"]; present {
+		if pct, err := strconv.Atoi(rawPct); err == nil && pct >= 0 && pct <= 100 {
+			rep.Pct = pct
+		}
+		rep.Warnings = append(rep.Warnings, "DMARC pct tag is historic under RFC 9989 and is ignored")
 	}
-	if rep.Pct < 100 {
-		rep.Warnings = append(rep.Warnings, fmt.Sprintf("DMARC pct is %d, not 100", rep.Pct))
+	if strings.EqualFold(tags["t"], "y") {
+		rep.Testing = true
+		rep.EffectivePolicy = lowerDMARCPolicy(rep.EffectivePolicy)
+		rep.Warnings = append(rep.Warnings, "DMARC testing mode t=y lowers the effective policy")
+	}
+	if rep.EffectivePolicy == "none" {
+		rep.Warnings = append(rep.Warnings, "DMARC effective policy is p=none")
 	}
 	if len(rep.RUA) == 0 {
 		rep.Warnings = append(rep.Warnings, "DMARC has no rua aggregate report destination")
 	}
+
+	sourceDomain := rep.PolicyDomain
 	for _, rua := range rep.RUA {
-		if externalReportDomain(domain, rua) {
+		if externalReportDomain(sourceDomain, rua) {
 			dest := domainFromMailto(rua)
-			authName := domain + "._report._dmarc." + dest
+			authName := sourceDomain + "._report._dmarc." + dest
 			authTXT, err := lookupTXT(ctx, r, authName)
 			if err != nil || !containsDMARCReportAuth(authTXT) {
 				rep.Warnings = append(rep.Warnings, "external DMARC rua destination lacks authorization record: "+authName)
 			}
 		}
 	}
-	return rep
+}
+
+func inheritedDMARCPolicy(ctx context.Context, r resolver, domain string, rep *DMARCReport) (string, string) {
+	exists, known := domainExists(ctx, r, domain)
+	if known {
+		rep.AuthorDomainExists = &exists
+	}
+	if known && !exists && validDMARCPolicy(rep.NonexistentPolicy) {
+		return rep.NonexistentPolicy, "np"
+	}
+	if validDMARCPolicy(rep.SubPolicy) {
+		return rep.SubPolicy, "sp"
+	}
+	return rep.Policy, "p"
+}
+
+func domainExists(ctx context.Context, r resolver, domain string) (bool, bool) {
+	checks := []func() error{
+		func() error { _, err := r.LookupIPAddr(ctx, domain); return err },
+		func() error { _, err := r.LookupMX(ctx, domain); return err },
+		func() error { _, err := r.LookupTXT(ctx, domain); return err },
+	}
+	allNotFound := true
+	for _, check := range checks {
+		err := check()
+		if err == nil {
+			return true, true
+		}
+		if !dnsNotFound(err) {
+			allNotFound = false
+		}
+	}
+	if allNotFound {
+		return false, true
+	}
+	return false, false
+}
+
+func lowerDMARCPolicy(policy string) string {
+	switch policy {
+	case "reject":
+		return "quarantine"
+	case "quarantine":
+		return "none"
+	default:
+		return policy
+	}
 }
 
 func dmarcFindings(rep DMARCReport, strict bool) []Finding {
@@ -752,12 +1265,12 @@ func dmarcFindings(rep DMARCReport, strict bool) []Finding {
 	}
 	for _, warning := range rep.Warnings {
 		severity := SeverityWarn
-		if strict && strings.Contains(warning, "p=none") {
+		if strict && strings.Contains(warning, "policy is p=none") {
 			severity = SeverityCritical
 		}
 		out = append(out, Finding{Severity: severity, Scope: "dmarc", Message: warning})
 	}
-	if rep.Policy == "quarantine" {
+	if rep.EffectivePolicy == "quarantine" {
 		out = append(out, Finding{Severity: SeverityInfo, Scope: "dmarc", Message: "DMARC policy is quarantine; reject is stricter"})
 	}
 	return out
@@ -842,7 +1355,25 @@ func dkimPublicKeyBits(keyType string, der []byte) (int, error) {
 }
 
 func checkMTASTS(ctx context.Context, r resolver, domain string, timeout time.Duration) MTASTSReport {
-	return checkMTASTSWithClient(ctx, r, domain, timeout, nil)
+	return checkMTASTSWithTargetPolicy(ctx, r, domain, timeout, true)
+}
+
+func checkMTASTSWithTargetPolicy(ctx context.Context, r resolver, domain string, timeout time.Duration, allowPrivate bool) MTASTSReport {
+	if !allowPrivate {
+		txts, lookupErr := lookupTXT(ctx, r, "_mta-sts."+domain)
+		if lookupErr == nil && len(validMTASTSTXTRecords(txts)) == 1 {
+			host := "mta-sts." + domain
+			if err := validateTargetHost(ctx, r, host); err != nil {
+				return MTASTSReport{
+					TXTRecord:  validMTASTSTXTRecords(txts)[0],
+					TXTPresent: true,
+					PolicyURL:  "https://" + host + "/.well-known/mta-sts.txt",
+					Error:      "MTA-STS target blocked: " + err.Error(),
+				}
+			}
+		}
+	}
+	return checkMTASTSWithClient(ctx, r, domain, timeout, newBIMIHTTPClient(r, timeout, allowPrivate))
 }
 
 func checkMTASTSWithClient(ctx context.Context, r resolver, domain string, timeout time.Duration, client *http.Client) MTASTSReport {
@@ -1130,7 +1661,9 @@ func checkBIMI(ctx context.Context, r resolver, domain string, dmarc DMARCReport
 	txts, err := lookupTXT(ctx, r, "default._bimi."+domain)
 	rep := BIMIReport{}
 	if err != nil {
-		rep.Error = err.Error()
+		if !dnsNotFound(err) {
+			rep.Error = "BIMI TXT lookup failed: " + err.Error()
+		}
 		return rep
 	}
 	for _, txt := range txts {
@@ -1144,6 +1677,10 @@ func checkBIMI(ctx context.Context, r resolver, domain string, dmarc DMARCReport
 		return rep
 	}
 	if len(rep.Records) == 0 {
+		return rep
+	}
+	if duplicates := duplicateTagKeys(rep.Records[0]); len(duplicates) > 0 {
+		rep.Error = "BIMI record has duplicate tag(s): " + strings.Join(duplicates, ", ")
 		return rep
 	}
 	rep.Tags = parseTags(rep.Records[0])
@@ -1173,10 +1710,17 @@ func checkBIMI(ctx context.Context, r resolver, domain string, dmarc DMARCReport
 		rep.Warning = "BIMI record explicitly declines to publish an indicator"
 	case rep.LogoURL == "":
 		rep.Warning = "BIMI record has no logo location; indicator discovery cannot complete"
-	case (dmarc.Policy != "quarantine" && dmarc.Policy != "reject") || dmarc.Pct != 100:
-		rep.Warning = "BIMI is present but DMARC is not enforced at quarantine or reject with pct=100"
+	case dmarcEnforcementPolicy(dmarc) != "quarantine" && dmarcEnforcementPolicy(dmarc) != "reject":
+		rep.Warning = "BIMI is present but the effective DMARC policy is not quarantine or reject"
 	}
 	return rep
+}
+
+func dmarcEnforcementPolicy(rep DMARCReport) string {
+	if rep.EffectivePolicy != "" {
+		return rep.EffectivePolicy
+	}
+	return rep.Policy
 }
 
 func hasExactBIMIVersion(record string) bool {
@@ -1193,25 +1737,31 @@ func validateBIMIHTTPSURI(raw string, requireSVG bool) error {
 	if parsed.Scheme != "https" || parsed.Hostname() == "" {
 		return fmt.Errorf("must use HTTPS with a fully qualified host")
 	}
+	if parsed.User != nil || parsed.Fragment != "" {
+		return fmt.Errorf("must not contain user information or a fragment")
+	}
 	host := strings.ToLower(parsed.Hostname())
 	if net.ParseIP(host) != nil || !strings.Contains(host, ".") || !validMTASTSMXPattern(host) {
 		return fmt.Errorf("must use HTTPS with a fully qualified host")
 	}
 	if requireSVG {
 		path := strings.ToLower(parsed.Path)
-		if !strings.HasSuffix(path, ".svg") && !strings.HasSuffix(path, ".svgz") {
-			return fmt.Errorf("must reference an SVG or SVGZ image")
+		if !strings.HasSuffix(path, ".svg") {
+			return fmt.Errorf("must reference an SVG image")
 		}
 	}
 	return nil
 }
 
 func bimiFindings(rep BIMIReport) []Finding {
-	if !rep.Present {
-		return nil
-	}
 	if rep.Error != "" {
 		return []Finding{{Severity: SeverityWarn, Scope: "bimi", Message: rep.Error}}
+	}
+	if rep.AssetError != "" {
+		return []Finding{{Severity: SeverityWarn, Scope: "bimi", Message: rep.AssetError}}
+	}
+	if !rep.Present {
+		return nil
 	}
 	if rep.Warning != "" {
 		return []Finding{{Severity: SeverityWarn, Scope: "bimi", Message: rep.Warning}}
@@ -1269,34 +1819,24 @@ func checkRBL(ctx context.Context, r resolver, ips []string, servers []string) [
 				if dnsNotFound(err) {
 					row.CleanOn = append(row.CleanOn, server)
 				} else {
+					row.ErrorOn = append(row.ErrorOn, server)
 					row.Errors = append(row.Errors, server+": lookup failed: "+err.Error())
 				}
 				continue
 			}
-			blocked := false
-			listed := false
-			for _, addr := range addrs {
-				ip4 := addr.IP.To4()
-				if ip4 == nil {
-					continue
-				}
-				if ip4[0] == 127 && ip4[1] == 0 && ip4[2] == 0 && ip4[3] == 1 {
-					blocked = true
-					continue
-				}
-				if ip4[0] == 127 && ip4[1] == 0 && ip4[2] == 0 && ip4[3] >= 2 {
-					listed = true
-				}
+			listed, answerErr := classifyDNSBLAnswers(addrs)
+			if answerErr != "" {
+				row.ErrorOn = append(row.ErrorOn, server)
+				row.Errors = append(row.Errors, server+": "+answerErr)
 			}
-			if blocked && !listed {
-				row.Errors = append(row.Errors, server+": query blocked or rate limited")
-			} else if listed {
+			if listed {
 				row.ListedOn = append(row.ListedOn, server)
-			} else {
+			} else if answerErr == "" {
 				row.CleanOn = append(row.CleanOn, server)
 			}
 		}
 		sort.Strings(row.CleanOn)
+		sort.Strings(row.ErrorOn)
 		sort.Strings(row.Errors)
 		sort.Strings(row.ListedOn)
 		out = append(out, row)
@@ -1322,28 +1862,14 @@ func checkDomainBL(ctx context.Context, r resolver, domain string, servers []str
 			}
 			continue
 		}
-		blocked := false
-		listed := false
-		for _, addr := range addrs {
-			ip4 := addr.IP.To4()
-			if ip4 == nil {
-				continue
-			}
-			if ip4[0] == 127 && ip4[1] == 0 && ip4[2] == 0 && ip4[3] == 1 {
-				blocked = true
-				continue
-			}
-			if ip4[0] == 127 {
-				listed = true
-				break
-			}
-		}
-		if blocked && !listed {
+		listed, answerErr := classifyDNSBLAnswers(addrs)
+		if answerErr != "" {
 			row.ErrorOn = append(row.ErrorOn, server)
-			row.Errors = append(row.Errors, server+": query blocked or rate limited")
-		} else if listed {
+			row.Errors = append(row.Errors, server+": "+answerErr)
+		}
+		if listed {
 			row.ListedOn = append(row.ListedOn, server)
-		} else {
+		} else if answerErr == "" {
 			row.CleanOn = append(row.CleanOn, server)
 		}
 	}
@@ -1353,7 +1879,37 @@ func checkDomainBL(ctx context.Context, r resolver, domain string, servers []str
 	return []DomainBLReport{row}
 }
 
+func classifyDNSBLAnswers(addrs []net.IPAddr) (bool, string) {
+	listed := false
+	var problems []string
+	for _, addr := range addrs {
+		ip4 := addr.IP.To4()
+		if ip4 == nil {
+			problems = append(problems, "unexpected non-IPv4 response "+addr.IP.String())
+			continue
+		}
+		switch {
+		case ip4[0] != 127:
+			problems = append(problems, "unexpected response "+addr.IP.String())
+		case ip4[1] == 255 && ip4[2] == 255:
+			problems = append(problems, "provider returned error code "+addr.IP.String())
+		case ip4[1] == 0 && ip4[2] == 0 && ip4[3] <= 1:
+			problems = append(problems, "query blocked, rate limited, or invalid ("+addr.IP.String()+")")
+		default:
+			listed = true
+		}
+	}
+	if len(addrs) == 0 {
+		problems = append(problems, "empty DNSBL answer")
+	}
+	return listed, strings.Join(problems, "; ")
+}
+
 func checkSMTP(ctx context.Context, mxs []MXRecord, hosts []string, ports []int, timeout time.Duration, checkOpenRelay bool) []SMTPReport {
+	return checkSMTPWithTargetPolicy(ctx, net.DefaultResolver, mxs, hosts, ports, timeout, checkOpenRelay, true)
+}
+
+func checkSMTPWithTargetPolicy(ctx context.Context, r resolver, mxs []MXRecord, hosts []string, ports []int, timeout time.Duration, checkOpenRelay bool, allowPrivate bool) []SMTPReport {
 	if len(hosts) == 0 {
 		for _, mx := range mxs {
 			hosts = append(hosts, mx.Host)
@@ -1367,15 +1923,105 @@ func checkSMTP(ctx context.Context, mxs []MXRecord, hosts []string, ports []int,
 		}
 	}
 	var wg sync.WaitGroup
+	dial := resolverDialer(r, timeout, allowPrivate)
 	for i := range out {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out[i] = checkSMTPHost(ctx, out[i].Host, out[i].Port, timeout, checkOpenRelay)
+			if !allowPrivate {
+				if err := validateTargetHost(ctx, r, out[i].Host); err != nil {
+					out[i].Error = "target blocked: " + err.Error()
+					return
+				}
+			}
+			out[i] = checkSMTPHostWithDial(ctx, out[i].Host, out[i].Port, timeout, checkOpenRelay, dial)
 		}(i)
 	}
 	wg.Wait()
 	return out
+}
+
+func resolverDialer(r resolver, timeout time.Duration, allowPrivate bool) func(context.Context, string, string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		var addresses []net.IPAddr
+		if ip := net.ParseIP(host); ip != nil {
+			addresses = []net.IPAddr{{IP: ip}}
+		} else {
+			addresses, err = r.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, resolved := range addresses {
+			parsed, ok := netip.AddrFromSlice(resolved.IP)
+			if !ok || (!allowPrivate && unsafeTargetAddress(parsed.Unmap())) {
+				continue
+			}
+			connection, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
+			if dialErr == nil {
+				return connection, nil
+			}
+			err = dialErr
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("no permitted address for %s", host)
+	}
+}
+
+func validateTargetHost(ctx context.Context, r resolver, host string) error {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" {
+		return fmt.Errorf("host is empty")
+	}
+	var ips []net.IPAddr
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IPAddr{{IP: ip}}
+	} else {
+		resolved, err := r.LookupIPAddr(ctx, host)
+		if err != nil {
+			return fmt.Errorf("cannot resolve %s: %w", host, err)
+		}
+		ips = resolved
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("%s has no IP addresses", host)
+	}
+	for _, resolved := range ips {
+		address, ok := netip.AddrFromSlice(resolved.IP)
+		if !ok || unsafeTargetAddress(address.Unmap()) {
+			return fmt.Errorf("%s resolves to non-public address %s", host, resolved.IP)
+		}
+	}
+	return nil
+}
+
+func unsafeTargetAddress(address netip.Addr) bool {
+	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() {
+		return true
+	}
+	prefixes := []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+	for _, prefix := range prefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
 }
 
 func checkSMTPHost(ctx context.Context, host string, port int, timeout time.Duration, checkOpenRelay bool) SMTPReport {
@@ -1409,7 +2055,8 @@ func checkSMTPHostWithDialAndTLS(ctx context.Context, host string, port int, tim
 	}
 	defer conn.Close()
 	rep.ConnectOK = true
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	stopDeadline := applyConnectionDeadline(ctx, conn, timeout)
+	defer stopDeadline()
 
 	if port == 465 {
 		rep.ImplicitTLS = true
@@ -1536,6 +2183,9 @@ func applySMTPState(rep *SMTPReport, state tls.ConnectionState) {
 		return
 	}
 	cert := state.PeerCertificates[0]
+	rep.certificate = cert
+	digest := sha256.Sum256(cert.Raw)
+	rep.CertSHA256 = hex.EncodeToString(digest[:])
 	rep.CertNotAfter = cert.NotAfter.UTC()
 	rep.CertDaysRemaining = int(time.Until(cert.NotAfter).Hours() / 24)
 	if rep.CertDaysRemaining < 0 {
@@ -1720,6 +2370,10 @@ func smtpFindings(rows []SMTPReport, strict bool) []Finding {
 }
 
 func checkMDA(ctx context.Context, domain string, hosts []string, ports []int, timeout time.Duration, explicit bool) []MDAReport {
+	return checkMDAWithTargetPolicy(ctx, net.DefaultResolver, domain, hosts, ports, timeout, explicit, true)
+}
+
+func checkMDAWithTargetPolicy(ctx context.Context, r resolver, domain string, hosts []string, ports []int, timeout time.Duration, explicit bool, allowPrivate bool) []MDAReport {
 	if len(hosts) == 0 {
 		hosts = []string{"imap." + domain, "pop." + domain, "mail." + domain}
 	}
@@ -1735,11 +2389,18 @@ func checkMDA(ctx context.Context, domain string, hosts []string, ports []int, t
 		}
 	}
 	var wg sync.WaitGroup
+	dial := resolverDialer(r, timeout, allowPrivate)
 	for i := range out {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out[i] = checkMDAHost(ctx, out[i].Host, out[i].Port, timeout)
+			if !allowPrivate {
+				if err := validateTargetHost(ctx, r, out[i].Host); err != nil {
+					out[i].Error = "target blocked: " + err.Error()
+					return
+				}
+			}
+			out[i] = checkMDAHostWithDial(ctx, out[i].Host, out[i].Port, timeout, dial)
 		}(i)
 	}
 	wg.Wait()
@@ -1807,7 +2468,8 @@ func checkMDAHostWithDialAndTLS(ctx context.Context, host string, port int, time
 	}
 	defer conn.Close()
 	rep.ConnectOK = true
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	stopDeadline := applyConnectionDeadline(ctx, conn, timeout)
+	defer stopDeadline()
 
 	if mdaImplicitTLS(port) {
 		tlsConn := tls.Client(conn, tlsConfig(host))
@@ -2022,6 +2684,18 @@ func mdaImplicitTLS(port int) bool {
 	return port == 993 || port == 995
 }
 
+func applyConnectionDeadline(ctx context.Context, conn net.Conn, timeout time.Duration) func() {
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	return func() { stop() }
+}
+
 func applyMDAState(rep *MDAReport, state tls.ConnectionState) {
 	rep.TLSVersion = tlsVersionName(state.Version)
 	if len(state.PeerCertificates) == 0 {
@@ -2093,10 +2767,16 @@ func normalizeDomain(domain string) string {
 		toParse = "//" + toParse
 	}
 	if parsed, err := url.Parse(toParse); err == nil && parsed.Hostname() != "" {
-		return strings.TrimSuffix(parsed.Hostname(), ".")
+		domain = strings.TrimSuffix(parsed.Hostname(), ".")
+	} else {
+		domain = strings.Split(domain, "/")[0]
+		domain = strings.TrimSuffix(domain, ".")
 	}
-	domain = strings.Split(domain, "/")[0]
-	return strings.TrimSuffix(domain, ".")
+	ascii, err := idna.Lookup.ToASCII(domain)
+	if err != nil {
+		return domain
+	}
+	return strings.ToLower(ascii)
 }
 
 func validMailDomain(domain string) bool {
@@ -2118,6 +2798,31 @@ func parseTags(record string) map[string]string {
 		tags[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(val)
 	}
 	return tags
+}
+
+func duplicateTagKeys(record string) []string {
+	seen := map[string]bool{}
+	duplicates := map[string]bool{}
+	for _, part := range strings.Split(record, ";") {
+		key, _, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			continue
+		}
+		if seen[key] {
+			duplicates[key] = true
+		}
+		seen[key] = true
+	}
+	keys := make([]string, 0, len(duplicates))
+	for key := range duplicates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func parseMailtoList(value string) []string {

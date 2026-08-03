@@ -8,7 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/systeampl/mailops/internal/mailcheck"
+	mailcheck "github.com/systeampl/mailops/pkg/mailops"
 )
 
 func printYAMLReports(reports []mailcheck.Report) {
@@ -33,6 +33,10 @@ func printPromReports(reports []mailcheck.Report) {
 	fmt.Println("# TYPE mailops_status_code gauge")
 	fmt.Println("# HELP mailops_status Mail deliverability aggregate status (1=current status, 0=otherwise).")
 	fmt.Println("# TYPE mailops_status gauge")
+	fmt.Println("# HELP mailops_posture_status_code Configuration posture status (0=ok, 1=warn, 2=critical, 3=error).")
+	fmt.Println("# TYPE mailops_posture_status_code gauge")
+	fmt.Println("# HELP mailops_availability_status_code Active service availability status (0=ok/not checked, 1=warn, 2=critical, 3=error).")
+	fmt.Println("# TYPE mailops_availability_status_code gauge")
 	fmt.Println("# HELP mailops_findings Number of findings by severity.")
 	fmt.Println("# TYPE mailops_findings gauge")
 	fmt.Println("# HELP mailops_record_present Presence of key mail records (1=present, 0=missing).")
@@ -47,6 +51,14 @@ func printPromReports(reports []mailcheck.Report) {
 	fmt.Println("# TYPE mailops_spf_lookup_limit_used gauge")
 	fmt.Println("# HELP mailops_dmarc_pct DMARC pct tag value.")
 	fmt.Println("# TYPE mailops_dmarc_pct gauge")
+	fmt.Println("# HELP mailops_dnssec_secure DNS response authentication through DNSSEC (1=authenticated, 0=not authenticated/error).")
+	fmt.Println("# TYPE mailops_dnssec_secure gauge")
+	fmt.Println("# HELP mailops_dane_tlsa_present TLSA record presence per mail endpoint (1=present, 0=absent).")
+	fmt.Println("# TYPE mailops_dane_tlsa_present gauge")
+	fmt.Println("# HELP mailops_dane_tlsa_valid TLSA record syntax and DNSSEC validity per mail endpoint (1=valid, 0=invalid/absent).")
+	fmt.Println("# TYPE mailops_dane_tlsa_valid gauge")
+	fmt.Println("# HELP mailops_dane_tlsa_matched Observed SMTP certificate match against TLSA (1=matched, 0=not matched/not observed).")
+	fmt.Println("# TYPE mailops_dane_tlsa_matched gauge")
 	fmt.Println("# HELP mailops_dkim_valid_selectors Number of valid DKIM selectors found.")
 	fmt.Println("# TYPE mailops_dkim_valid_selectors gauge")
 	fmt.Println("# HELP mailops_dkim_selector_ok DKIM selector health (1=ok, 0=missing/error).")
@@ -61,6 +73,8 @@ func printPromReports(reports []mailcheck.Report) {
 	fmt.Println("# TYPE mailops_rbl_hits gauge")
 	fmt.Println("# HELP mailops_rbl_listed DNSBL listing status per IP (1=listed, 0=not listed).")
 	fmt.Println("# TYPE mailops_rbl_listed gauge")
+	fmt.Println("# HELP mailops_rbl_lookup_error DNSBL lookup or provider response error per IP and zone (1=error, 0=no error).")
+	fmt.Println("# TYPE mailops_rbl_lookup_error gauge")
 	fmt.Println("# HELP mailops_domainbl_hits Number of domain reputation DNSBL listings.")
 	fmt.Println("# TYPE mailops_domainbl_hits gauge")
 	fmt.Println("# HELP mailops_domainbl_listed Domain reputation DNSBL listing status per zone (1=listed, 0=not listed).")
@@ -105,6 +119,8 @@ func printPromReports(reports []mailcheck.Report) {
 		fmt.Printf("mailops_check_duration_seconds{%s} %.3f\n", promLabels(base), float64(report.DurationMS)/1000)
 		fmt.Printf("mailops_last_check_timestamp_seconds{%s} %d\n", promLabels(base), report.GeneratedAt.Unix())
 		fmt.Printf("mailops_status_code{%s} %d\n", promLabels(base), statusCode(report.Status))
+		fmt.Printf("mailops_posture_status_code{%s} %d\n", promLabels(base), statusCode(report.PostureStatus))
+		fmt.Printf("mailops_availability_status_code{%s} %d\n", promLabels(base), statusCode(report.AvailabilityStatus))
 		for _, status := range []string{"ok", "warn", "critical", "error"} {
 			fmt.Printf("mailops_status{%s} %d\n", promLabels(map[string]string{
 				"domain": report.Domain,
@@ -118,6 +134,13 @@ func printPromReports(reports []mailcheck.Report) {
 			}), findingCount(report, sev))
 		}
 		fmt.Printf("mailops_mx_records{%s} %d\n", promLabels(base), report.RecordCounts.MX)
+		fmt.Printf("mailops_dnssec_secure{%s} %d\n", promLabels(base), boolInt(report.DNSSEC.Secure))
+		for _, row := range report.DANE {
+			labels := map[string]string{"domain": report.Domain, "host": row.Host, "port": strconv.Itoa(row.Port)}
+			fmt.Printf("mailops_dane_tlsa_present{%s} %d\n", promLabels(labels), boolInt(row.Present))
+			fmt.Printf("mailops_dane_tlsa_valid{%s} %d\n", promLabels(labels), boolInt(row.Valid))
+			fmt.Printf("mailops_dane_tlsa_matched{%s} %d\n", promLabels(labels), boolInt(row.Matched))
+		}
 		for _, record := range []struct {
 			name string
 			ok   bool
@@ -168,6 +191,15 @@ func printPromReports(reports []mailcheck.Report) {
 				"domain": report.Domain,
 				"ip":     row.IP,
 			}), boolInt(len(row.ListedOn) > 0))
+			for _, zone := range row.CleanOn {
+				fmt.Printf("mailops_rbl_lookup_error{%s} 0\n", promLabels(map[string]string{"domain": report.Domain, "ip": row.IP, "zone": zone}))
+			}
+			for _, zone := range row.ListedOn {
+				fmt.Printf("mailops_rbl_lookup_error{%s} 0\n", promLabels(map[string]string{"domain": report.Domain, "ip": row.IP, "zone": zone}))
+			}
+			for _, zone := range row.ErrorOn {
+				fmt.Printf("mailops_rbl_lookup_error{%s} 1\n", promLabels(map[string]string{"domain": report.Domain, "ip": row.IP, "zone": zone}))
+			}
 		}
 		fmt.Printf("mailops_domainbl_hits{%s} %d\n", promLabels(base), report.RecordCounts.DomainBLHits)
 		for _, row := range report.DomainBL {

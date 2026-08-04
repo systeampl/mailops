@@ -1,5 +1,8 @@
 /mailops
 /dist/
+/coverage.out
+.gocache/
+.gomodcache/
 *.out
 *.test
 .DS_Store

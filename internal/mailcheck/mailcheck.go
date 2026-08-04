@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	SchemaVersion    = "1.0"
+	SchemaVersion    = "mailops.report.v1"
 	SeverityInfo     = "info"
 	SeverityWarn     = "warn"
 	SeverityCritical = "critical"
@@ -1527,9 +1527,7 @@ func validateMTASTSPolicy(policy map[string]string) error {
 
 func validMTASTSMXPattern(pattern string) bool {
 	pattern = strings.TrimSpace(strings.ToLower(pattern))
-	if strings.HasPrefix(pattern, "*.") {
-		pattern = strings.TrimPrefix(pattern, "*.")
-	}
+	pattern = strings.TrimPrefix(pattern, "*.")
 	if pattern == "" || len(pattern) > 253 || strings.Contains(pattern, "*") {
 		return false
 	}
@@ -2439,10 +2437,6 @@ func normalizeHosts(hosts []string) []string {
 		normalizedHosts = append(normalizedHosts, host)
 	}
 	return normalizedHosts
-}
-
-func checkMDAHost(ctx context.Context, host string, port int, timeout time.Duration) MDAReport {
-	return checkMDAHostWithDial(ctx, host, port, timeout, nil)
 }
 
 func checkMDAHostWithDial(ctx context.Context, host string, port int, timeout time.Duration, dial func(context.Context, string, string) (net.Conn, error)) MDAReport {

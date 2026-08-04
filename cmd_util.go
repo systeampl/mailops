@@ -6,6 +6,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -65,6 +67,16 @@ func printJSON(v any) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
+		fatal(err.Error())
+	}
+}
+
+func printYAMLValue(v any) {
+	data, err := yaml.Marshal(v)
+	if err != nil {
+		fatal(err.Error())
+	}
+	if _, err := os.Stdout.Write(data); err != nil {
 		fatal(err.Error())
 	}
 }

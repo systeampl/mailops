@@ -1,4 +1,4 @@
-name: CI
+name: ci
 
 on:
   push:
@@ -9,20 +9,76 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test / ${{ matrix.os }} / go ${{ matrix.go }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ["1.25.x", "1.26.x"]
+    env:
+      GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - name: checkout
+        uses: actions/checkout@v6
+      - name: setup go
+        uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
           cache: true
-      - run: go mod verify
-      - run: test -z "$(gofmt -l .)"
-      - run: go vet ./...
-      - run: go test -race -shuffle=on -count=2 ./...
-      - run: go test -coverprofile=coverage.out ./...
-      - run: go build -trimpath ./...
-      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - run: govulncheck ./...
+          cache-dependency-path: go.sum
+      - name: verify modules
+        run: go mod verify
+      - name: check formatting
+        run: test -z "$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+      - name: test with race detector and shuffled order
+        run: go test -race -shuffle=on -count=1 ./...
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build -trimpath -buildvcs=false ./...
+
+  vulnerability-scan:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+      - name: setup go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+          cache-dependency-path: go.sum
+      - name: scan reachable vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  static-analysis:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+      - name: setup go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+          cache-dependency-path: go.sum
+      - name: run staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+      - name: lint GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12

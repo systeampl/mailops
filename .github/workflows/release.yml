@@ -1,4 +1,4 @@
-name: Release
+name: release
 
 on:
   push:
@@ -10,18 +10,25 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v6
+      - name: setup go
+        uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: "1.26.x"
           cache: true
-      - uses: goreleaser/goreleaser-action@v6
+          cache-dependency-path: go.sum
+      - name: release archives and checksums
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: latest
+          version: "v2.17.1"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

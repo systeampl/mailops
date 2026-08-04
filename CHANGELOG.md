@@ -5,6 +5,18 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- aligned CI, releases, dependency updates, security guidance, and build
+  metadata with the SysTeam Ops Tools contract
+- standardized `version` and `--version` text, JSON, and YAML output
+- normalized the public report schema identifier to `mailops.report.v1`
+
+### Fixed
+
+- removed dead probe code and simplified MTA-STS wildcard normalization found
+  by Staticcheck
+
 ## [0.2.0] - 2026-08-03
 
 ### Added

@@ -9,6 +9,12 @@ import (
 )
 
 func TestPublicEngineSchemaAndFindingCodes(t *testing.T) {
+	if SchemaVersion != "mailops.report.v1" {
+		t.Fatalf("SchemaVersion = %q", SchemaVersion)
+	}
+	if SeverityInfo != "info" || SeverityWarn != "warn" || SeverityCritical != "critical" || SeverityError != "error" {
+		t.Fatal("unexpected severity contract")
+	}
 	report := Run(context.Background(), Options{Domain: "not a domain", Timeout: time.Second})
 	if report.SchemaVersion != SchemaVersion || report.PostureStatus != SeverityError || report.AvailabilityStatus != "not_checked" {
 		t.Fatalf("unexpected public report status: %#v", report)

@@ -5,18 +5,16 @@ import (
 	"os"
 )
 
-var version = "0.2.0"
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
-		return
+		os.Exit(2)
 	}
 	switch os.Args[1] {
 	case "check":
 		runCheck(os.Args[2:])
-	case "version":
-		fmt.Println("mailops", version)
+	case "version", "--version":
+		cmdVersion(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -25,14 +23,15 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`mailops - mail deliverability and email security operations checks
+	fmt.Fprintln(os.Stderr, `mailops - mail deliverability and email security operations checks
 
 Usage:
   mailops check <domain...> [--json|--yaml|--prom] [options]
-  mailops version
+  mailops version [--json|--yaml]
 
 Commands:
   check      Run mail DNS, policy, DNSSEC/DANE, reputation and endpoint checks
+  version    Print build metadata
 
 Common options:
   --profile <name>        Provider profile, e.g. google-workspace, microsoft-365

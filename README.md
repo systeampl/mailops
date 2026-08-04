@@ -1,9 +1,17 @@
 # mailops
 
+[![CI](https://github.com/systeampl/mailops/actions/workflows/ci.yml/badge.svg)](https://github.com/systeampl/mailops/actions/workflows/ci.yml)
+
 `mailops` is a standalone mail deliverability, email security, and mail
-operations checker. It is designed to fit the same ecosystem as `dnsops` and
-`certops`: human-friendly terminal output, JSON/YAML reports, Prometheus text
-output, and optional OTLP/HTTP metric export.
+operations checker with human-friendly terminal output, JSON/YAML reports,
+Prometheus text output, and optional OTLP/HTTP metric export.
+
+Part of [SysTeam Ops Tools](https://github.com/systeampl):
+[dnsops](https://github.com/systeampl/dnsops) ·
+[certops](https://github.com/systeampl/certops) ·
+[mailops](https://github.com/systeampl/mailops). The open-source tools are
+built by [SysTeam](https://systeam.pl), run standalone, and provide structured
+results designed for deep checks in [SysChecks](https://syschecks.com).
 
 ## Quick Start
 
@@ -70,7 +78,7 @@ also require access to their respective network endpoints.
 
 ```text
 mailops check <domain...> [--json|--yaml|--prom] [options]
-mailops version
+mailops version [--json|--yaml]
 ```
 
 Options may appear before or after the domain. List options are repeatable and
@@ -284,8 +292,12 @@ time, and duration. Prometheus and OTEL output expose the operational subset
 as metrics rather than serializing the entire report.
 
 `schema_version` identifies the machine-readable contract. Consumers can use
-the supported Go API at `github.com/systeampl/mailops/pkg/mailops`; breaking
-schema changes increment the major component.
+the supported Go API at `github.com/systeampl/mailops/pkg/mailops`. The current
+value is `mailops.report.v1`; new fields may be added within that version and
+breaking changes increment its major component. Common finding severity
+constants are `info`, `warn`, `critical`, and `error`. Integration adapters
+belong in the consuming product, so the standalone tool and its public engine
+remain reusable.
 
 ## Batch and YAML configuration
 
@@ -481,3 +493,7 @@ go tool cover -func=coverage.out
 - Provider profiles are operational defaults, not authoritative vendor APIs.
 - The live integration suite verifies public DNS/policy discovery; it does not
   send mail or require mailbox credentials.
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE).

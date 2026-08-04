@@ -27,7 +27,7 @@ jobs:
       GOTOOLCHAIN: local
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: setup go
         uses: actions/setup-go@v6
         with:
@@ -53,7 +53,7 @@ jobs:
       GOTOOLCHAIN: local
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: setup go
         uses: actions/setup-go@v6
         with:
@@ -71,7 +71,7 @@ jobs:
       GOTOOLCHAIN: local
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: setup go
         uses: actions/setup-go@v6
         with:
